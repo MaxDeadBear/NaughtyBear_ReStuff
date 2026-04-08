@@ -1,6 +1,9 @@
 <img width="1280" height="816" alt="Untitled9_20260407232555" src="https://github.com/user-attachments/assets/e43c6514-cac4-47a2-93a6-92f19863f1bb" />
 
 
+## VERSION: NAUGHTY BEAR GOLD (Because All DLC Included)
+
+
 ## HOW TO BUILD
 
 Install Rexglue-SDK following the [wiki](https://github.com/rexglue/rexglue-sdk/wiki/Getting-Started)
