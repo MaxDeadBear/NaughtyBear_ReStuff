@@ -38,6 +38,4 @@ MadLadMikael - for helping setup and teaching how to use REXGLUESDK and GITHUB
 
 ## DISCLAIMER
 
-Please support the official release of Naughty Bear. while this may be the alternative you may prefer they worked hard on the original game as well
-
 RE-STUFFED AND ITS DEVELOPERS DOES NOT CONDONE PIRACY.
