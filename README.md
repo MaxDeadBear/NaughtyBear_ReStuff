@@ -1,4 +1,4 @@
-<img width="1280" height="816" alt="Untitled9_20260407232555" src="https://github.com/user-attachments/assets/e43c6514-cac4-47a2-93a6-92f19863f1bb" />
+<img width="1280" height="816" alt="Untitled9_20260413012316" src="https://github.com/user-attachments/assets/9e4347d4-cc8e-437f-9da6-a2fafdf8537e" />
 
 
 ## VERSION: NAUGHTY BEAR GOLD (Because All DLC Included)
