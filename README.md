@@ -13,9 +13,11 @@ dump your copy of Naughty Bear (Xbox360) and use a tool like ISO-Extract to dump
 place the contents of the iso in the assets folder (INCLUDING THE DEFAULT.XEX FILE)
 open the folder in visual studio, go into cmake targets view
 change the configuration to win-amd64-relwithdebinfo
-put rexglue.exe in your path environment variable and do rexglue codegen restuffed_config.toml in a terminal (visual studios works, or you can use windows default terminal/cmd/powershell)
-right click restuffed project and select build all
+put rexglue.exe in your path environment variable and do `rexglue codegen restuff_manifest.toml` in a terminal (visual studios works, or you can use windows default terminal/cmd/powershell). You can also just build the `restuff_codegen` CMake target instead of running the command by hand.
+right click the restuff project and select build all
 copy the assets folder with the dumped contents of the iso into out/build/win-amd64-relwithdebinfo
+
+note: this project targets the new ReXGlue SDK (0.8.1) manifest layout. Codegen is driven by `restuff_manifest.toml` (not the old `restuff_config.toml`), and a default `restuff.toml` runtime config (windowed mode + the `xenos` GPU plugin) is staged next to the executable on build.
 
 ---
 

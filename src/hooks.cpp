@@ -10,7 +10,7 @@
 
 #include <rex/cvar.h>
 #include <rex/graphics/graphics_system.h>
-#include <rex/ppc/types.h>
+#include <rex/ppc/context.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 
