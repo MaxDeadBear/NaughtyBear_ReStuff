@@ -13,6 +13,7 @@
 
 #include "fps_overlay.h"
 #include "cheats_overlay.h"
+#include "trophy_overlay.h"
 
 class RestuffApp : public rex::ReXApp {
  public:
@@ -40,6 +41,7 @@ class RestuffApp : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     drawer->AddDialog(new FpsOverlayDialog(drawer));
     drawer->AddDialog(new CheatsDialog(drawer));
+    drawer->AddDialog(new TrophyOverlayDialog(drawer));
   }
 
   // Default the game data root to the project's assets folder when

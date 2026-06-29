@@ -63,6 +63,33 @@ name = "inject_score_bonus"
 registers = ["r31"]
 after_instruction = true
 
+# DamageableComponent::GetRemainingHitPoints entry. r3 = IDamageable interface
+# (component + 32). Called constantly (HUD/AI read HP), so it lets us capture the
+# player's damageable for health regen without needing combat (see on_read_hp).
+[[entrypoint.midasm_hook]]
+address = 0x82A22348
+name = "on_read_hp"
+registers = ["r3"]
+after_instruction = false
+
+# lua_load(L, reader, data, chunkname) entry: r5 = reader data {buf,size},
+# r6 = chunk name. Lets us dump every loaded Lua chunk's bytecode to find the
+# per-level medal score targets (see on_lua_load). Approach from the lua_mods branch.
+[[entrypoint.midasm_hook]]
+address = 0x82BB5010
+name = "on_lua_load"
+registers = ["r5", "r6"]
+after_instruction = false
+
+# GradeScore::GetScoreWithGrade(gradeScore, grade) entry (sub_826FAFD8): r3 =
+# the current level's GradeScore object. The game queries it per grade to
+# evaluate medals, so this captures the active medal thresholds for the overlay.
+[[entrypoint.midasm_hook]]
+address = 0x826FAFD8
+name = "on_grade_query"
+registers = ["r3"]
+after_instruction = false
+
 [[entrypoint.midasm_hook]]
 address = 0x82f47dd4
 name = "on_ctx_reg_header"
