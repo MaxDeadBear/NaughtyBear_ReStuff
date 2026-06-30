@@ -12,6 +12,11 @@ extern float get_score_bonus();
 void set_wireframe(bool val);
 bool get_wireframe();
 
+// Unlock-all is the unlock_all cvar; while on, all costumes/content are forced
+// unlocked (re-applied continuously). See maybe_unlock_all() in hooks.cpp.
+void set_unlock_all(bool val);
+bool get_unlock_all();
+
 class CheatsDialog : public rex::ui::ImGuiDialog {
 public:
     explicit CheatsDialog(rex::ui::ImGuiDrawer* drawer)
@@ -43,6 +48,10 @@ public:
             bool wf = get_wireframe();
             if (ImGui::Checkbox("Wireframe", &wf))
                 set_wireframe(wf);
+
+            bool ua = get_unlock_all();
+            if (ImGui::Checkbox("Unlock all costumes/content", &ua))
+                set_unlock_all(ua);
         }
         ImGui::End();
     }

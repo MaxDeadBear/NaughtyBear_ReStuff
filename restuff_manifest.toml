@@ -90,6 +90,14 @@ name = "on_grade_query"
 registers = ["r3"]
 after_instruction = false
 
+# UnlockableManager::GetUnlockable(manager, id) entry (sub_826F5648): r3 =
+# UnlockableManager. Captured so the unlock_all cvar can call UnlockAllUnlockables.
+[[entrypoint.midasm_hook]]
+address = 0x826F5648
+name = "on_get_unlockable"
+registers = ["r3"]
+after_instruction = false
+
 [[entrypoint.midasm_hook]]
 address = 0x82f47dd4
 name = "on_ctx_reg_header"

@@ -8,6 +8,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -29,7 +31,7 @@ REXCVAR_DEFINE_INT32(fps_cap, 60, "Performance", "Software frame rate cap. Value
         return v == "20" || v == "30" || v == "60";
     });
 
-REXCVAR_DEFINE_BOOL(wireframe, false, "Debug", "Force wireframe rendering on all geometry.");
+REXCVAR_DEFINE_BOOL(wireframe, false, "Cheats", "Force wireframe rendering on all geometry.");
 
 // --- Health regeneration --------------------------------------------------
 // Continuously regenerates the player's health to balance the later levels
@@ -45,23 +47,17 @@ REXCVAR_DEFINE_BOOL(health_regen_hud, true, "Gameplay",
     "Heal through the game's damage pipeline so the on-screen health bar "
     "updates. Disable for a silent field write if it misbehaves.");
 
-// --- Trophy / medal target tracker ----------------------------------------
-// The per-level medal score targets live in the game's Lua data and aren't
-// readable from native code, so they're entered here (persisted in restuff.toml)
-// and the overlay shows points-to-next against the live level score. 0 = unset.
-REXCVAR_DEFINE_INT32(trophy_bronze, 0, "Gameplay", "Bronze medal score target (0 = unset).");
-REXCVAR_DEFINE_INT32(trophy_silver, 0, "Gameplay", "Silver medal score target (0 = unset).");
-REXCVAR_DEFINE_INT32(trophy_gold,   0, "Gameplay", "Gold medal score target (0 = unset).");
-REXCVAR_DEFINE_INT32(trophy_plat,   0, "Gameplay", "Platinum medal score target (0 = unset).");
-
 // Dump every loaded Lua chunk's bytecode to lua_dump/<path> (basis: lua_mods
 // branch). Use to extract the per-level medal score targets.
 REXCVAR_DEFINE_BOOL(lua_dump_originals, false, "Modding",
     "Dump every loaded Lua chunk's original bytecode to lua_dump/<path>.");
+REXCVAR_DEFINE_BOOL(unlock_all, false, "Cheats",
+    "Unlock all costumes/content (calls UnlockAllUnlockables continuously).");
 
 // Defined below on_swap; called once per presented frame.
 static void update_health_regen(double dt);
 static void update_level_score();
+static void maybe_unlock_all();
 
 // Set Windows timer resolution to 1ms for the lifetime of the process.
 // Default is 15.6ms which causes sleep_until to overshoot badly.
@@ -125,6 +121,9 @@ void on_swap() {
 
     // Cache the live level score for the trophy overlay.
     update_level_score();
+
+    // One-shot "unlock everything" when requested via the unlock_all cvar.
+    maybe_unlock_all();
 }
 
 double get_fps() { return s_fps_display; }
@@ -220,6 +219,9 @@ std::atomic<int> g_trophy_auto[4] = {{0}, {0}, {0}, {0}};
 // Live HazingScoreMgr (captured from inject_score_bonus). +0x88 = float total
 // score (the on-screen HUD score), which is what medals are graded against.
 std::atomic<uint32_t> g_score_mgr{0};
+
+// UnlockableManager (captured from on_get_unlockable), for the unlock_all cvar.
+std::atomic<uint32_t> g_unlock_mgr{0};
 
 
 
@@ -405,26 +407,8 @@ int get_level_score() { return g_level_score.load(std::memory_order_relaxed); }
 
 int get_trophy_target(int tier) {
     if (tier < 0 || tier > 3) return 0;
-    const int autov = g_trophy_auto[tier].load(std::memory_order_relaxed);
-    if (autov > 0) return autov;  // captured from the game; falls back to cvar override
-    switch (tier) {
-        case 0: return REXCVAR_GET(trophy_bronze);
-        case 1: return REXCVAR_GET(trophy_silver);
-        case 2: return REXCVAR_GET(trophy_gold);
-        case 3: return REXCVAR_GET(trophy_plat);
-        default: return 0;
-    }
-}
-
-void set_trophy_target(int tier, int value) {
-    if (value < 0) value = 0;
-    switch (tier) {
-        case 0: REXCVAR_SET(trophy_bronze, value); break;
-        case 1: REXCVAR_SET(trophy_silver, value); break;
-        case 2: REXCVAR_SET(trophy_gold, value); break;
-        case 3: REXCVAR_SET(trophy_plat, value); break;
-        default: break;
-    }
+    // Auto-resolved from the game's GradeScore (see on_grade_query); 0 = unknown.
+    return g_trophy_auto[tier].load(std::memory_order_relaxed);
 }
 
 // Hooked at DamageableComponent::GetRemainingHitPoints entry (0x82A22348). r3 is
@@ -463,11 +447,13 @@ void on_read_hp(PPCRegister& r3) {
 }
 
 // ---------------------------------------------------------------------------
-// Lua chunk dumper (basis: lua_mods branch)
+// Lua chunk dump + mod injection (basis: lua_mods branch)
 // ---------------------------------------------------------------------------
 // Hooked at lua_load (0x82BB5010): r5 = reader data {buf,size}, r6 = chunk name.
-// When lua_dump_originals is set, write each chunk's bytecode (Xbox-360 Lua 5.1)
-// to lua_dump/<path> so we can read the per-level medal score targets.
+//  - lua_dump_originals: write each chunk's bytecode to lua_dump/<path>.
+//  - Always: if lua_mods/<path> (or lua_mods/<basename>) exists, load it into
+//    guest memory and repoint the reader at it, so the game runs YOUR chunk.
+//    Mod files must be Xbox-360 Lua 5.1 bytecode (header "\x1bLuaQ", big-endian).
 
 // Normalize a guest chunk path to a lua_dump-relative key.
 static std::string lua_mod_key(const char* path, size_t len) {
@@ -480,35 +466,78 @@ static std::string lua_mod_key(const char* path, size_t len) {
     return s;
 }
 
-static void dump_lua_original(const std::string& key, uint8_t* base, uint32_t data) {
+static void dump_lua_original(const std::string& key, rex::memory::Memory* mem, uint32_t data) {
     static std::mutex m;
     static std::unordered_map<std::string, int> seen;
     std::lock_guard<std::mutex> lock(m);
     if (seen[key]++) return;  // once per chunk
-    const uint32_t buf  = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + data));
-    const uint32_t size = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + data + 4));
+    const uint32_t buf  = __builtin_bswap32(*mem->TranslateVirtual<const uint32_t*>(data));
+    const uint32_t size = __builtin_bswap32(*mem->TranslateVirtual<const uint32_t*>(data + 4));
     if (!buf || !size || size > (16u << 20)) return;
     const std::filesystem::path out_path = std::filesystem::path("lua_dump") / key;
     std::error_code ec;
     std::filesystem::create_directories(out_path.parent_path(), ec);
     std::ofstream out(out_path, std::ios::binary);
-    if (out) out.write(reinterpret_cast<const char*>(base + buf), size);
+    if (out) out.write(mem->TranslateVirtual<const char*>(buf), size);
+}
+
+// Load lua_mods/<rel> into guest system memory; returns {guest_addr, size} or {0,0}.
+static std::pair<uint32_t, uint32_t> load_mod_file(const std::string& rel) {
+    std::ifstream f("lua_mods/" + rel, std::ios::binary | std::ios::ate);
+    if (!f) return {0, 0};
+    const std::streamsize len = f.tellg();
+    if (len <= 0 || len >= (16 << 20)) return {0, 0};
+    f.seekg(0);
+    std::vector<char> bytes(static_cast<size_t>(len));
+    if (!f.read(bytes.data(), len)) return {0, 0};
+    auto* mem = rex::system::kernel_memory();
+    const uint32_t addr = mem ? mem->SystemHeapAlloc(static_cast<uint32_t>(len), 0x20) : 0u;
+    if (!addr) { REXLOG_WARN("[lua] mod '{}' alloc failed", rel); return {0, 0}; }
+    std::memcpy(mem->TranslateVirtual<uint8_t*>(addr), bytes.data(), static_cast<size_t>(len));
+    REXLOG_INFO("[lua] mod loaded '{}' ({} bytes) -> guest {:08X}", rel, static_cast<int>(len), addr);
+    return {addr, static_cast<uint32_t>(len)};
+}
+
+// Replacement bytecode for a chunk key: try the full path, then the basename.
+// Cached (including negative results, so we don't re-stat every load).
+static std::pair<uint32_t, uint32_t> get_lua_replacement(const std::string& key) {
+    static std::mutex m;
+    static std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> cache;
+    std::lock_guard<std::mutex> lock(m);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    std::pair<uint32_t, uint32_t> r = load_mod_file(key);
+    if (!r.first) {
+        const size_t slash = key.find_last_of('/');
+        const std::string bn = (slash == std::string::npos) ? key : key.substr(slash + 1);
+        if (bn != key) r = load_mod_file(bn);
+    }
+    cache.emplace(key, r);
+    return r;
 }
 
 // Midasm hook at lua_load entry: r5 = reader data {buf,size}, r6 = chunk name.
+// Dumps the original (when enabled) and, if a matching file exists under
+// lua_mods/, repoints the reader at it so the game runs the modded chunk.
 void on_lua_load(PPCRegister& r5, PPCRegister& r6) {
-    if (!REXCVAR_GET(lua_dump_originals)) return;
     const uint32_t data = r5.u32;
     const uint32_t name_addr = r6.u32;
     if (!data || !name_addr) return;
     auto* mem = rex::system::kernel_memory();
     if (!mem) return;
-    uint8_t* base = mem->virtual_membase();
-    if (!base) return;
-    const char* path = reinterpret_cast<const char*>(base + name_addr);
+    const char* path = mem->TranslateVirtual<const char*>(name_addr);
     size_t len = 0;
     while (len < 256 && path[len]) ++len;
-    dump_lua_original(lua_mod_key(path, len), base, data);
+    const std::string key = lua_mod_key(path, len);
+
+    if (REXCVAR_GET(lua_dump_originals)) dump_lua_original(key, mem, data);
+
+    const auto repl = get_lua_replacement(key);
+    if (repl.first) {
+        *mem->TranslateVirtual<uint32_t*>(data + 0) = __builtin_bswap32(repl.first);
+        *mem->TranslateVirtual<uint32_t*>(data + 4) = __builtin_bswap32(repl.second);
+        REXLOG_INFO("[lua] INJECT '{}' <- {} bytes", key, repl.second);
+    }
 }
 
 // Midasm hook at GradeScore::GetScoreWithGrade entry (0x826FAFD8): r3 = the
@@ -520,6 +549,59 @@ void on_grade_query(PPCRegister& r3) {
     if (gs < 0x10000u || gs >= 0xC0000000u || (gs & 3u) != 0u) return;  // implausible ptr
     if (g_grade_score.exchange(gs, std::memory_order_relaxed) != gs) {
         for (auto& a : g_trophy_auto) a.store(0, std::memory_order_relaxed);  // re-query
+    }
+}
+
+// Hooked at UnlockableManager::GetUnlockable entry (sub_826F5648): r3 = manager.
+void on_get_unlockable(PPCRegister& r3) {
+    const uint32_t m = r3.u32;
+    if (m >= 0x10000u && m < 0xC0000000u && (m & 3u) == 0u)
+        g_unlock_mgr.store(m, std::memory_order_relaxed);
+}
+
+// Resolve the UnlockableManager directly via the engine's service locator,
+// independent of any menu. The game stores it as a lazily-created singleton in
+// its Ref registry: the Ref ctor (sub_8243C0F8) returns the registered instance
+// or creates one via the factory (sub_82430788 = alloc 292 + ctor sub_826F75A0).
+// This is the same path the save-load code (sub_827E5E48) uses to get it, so we
+// always get the real instance. Returns the guest manager pointer, or 0.
+static uint32_t resolve_unlock_mgr() {
+    auto* fd  = rex::Runtime::instance()->function_dispatcher();
+    auto* mem = rex::system::kernel_memory();
+    if (!fd || !mem) return 0;
+    auto* ctor = fd->GetFunction(0x8243C0F8u);  // Ref<UnlockableManager> ctor
+    if (!ctor) return 0;
+    // 8-byte guest Ref struct {manager*, refnode*}; allocate once, reuse.
+    static uint32_t ref_buf = mem->SystemHeapAlloc(8, 0x20);
+    if (!ref_buf) return 0;
+    *mem->TranslateVirtual<uint32_t*>(ref_buf)     = 0;
+    *mem->TranslateVirtual<uint32_t*>(ref_buf + 4) = 0;
+    rex::ppc::GuestToHostFunction<void>(*ctor, ref_buf, 0x82430788u);
+    // We intentionally do NOT release the ref (sub_824394A8): leaking one
+    // reference keeps the singleton alive for the rest of the session.
+    return __builtin_bswap32(*mem->TranslateVirtual<const uint32_t*>(ref_buf));
+}
+
+// While unlock_all is set, force every unlockable's "unlocked" flag on by
+// calling the game's UnlockAllUnlockables(manager, true) (sub_826F4E78, which
+// sets byte +12 = 1 on every entry in the manager's four unlockable vectors).
+// The manager comes from on_get_unlockable if that fired, otherwise we resolve
+// it ourselves. Re-applied ~1/sec so content stays unlocked if the game
+// re-evaluates locks; leave the cvar on as a toggle.
+static void maybe_unlock_all() {
+    if (!REXCVAR_GET(unlock_all)) return;
+    uint32_t m = g_unlock_mgr.load(std::memory_order_relaxed);
+    if (!m) {
+        m = resolve_unlock_mgr();
+        if (m < 0x10000u || m >= 0xC0000000u || (m & 3u) != 0u) return;  // not ready
+        g_unlock_mgr.store(m, std::memory_order_relaxed);
+        REXLOG_INFO("[unlock] resolved UnlockableManager {:08X}", m);
+    }
+    static int tick = 0;
+    if (tick++ % 60 != 0) return;  // ~once per second (on_swap is per-frame)
+    if (auto* fd = rex::Runtime::instance()->function_dispatcher()) {
+        if (auto* fn = fd->GetFunction(0x826F4E78u))  // UnlockAllUnlockables(mgr, true)
+            rex::ppc::GuestToHostFunction<void>(*fn, m, 1);
     }
 }
 
@@ -548,6 +630,12 @@ float get_score_bonus() {
 
 void set_wireframe(bool val) { REXCVAR_SET(wireframe, val); }
 bool get_wireframe()        { return REXCVAR_GET(wireframe); }
+
+void set_unlock_all(bool val) {
+    REXCVAR_SET(unlock_all, val);
+    if (!val) g_unlock_mgr.store(0, std::memory_order_relaxed);  // re-resolve next time
+}
+bool get_unlock_all()        { return REXCVAR_GET(unlock_all); }
 
 // ---------------------------------------------------------------------------
 // Wireframe ring-buffer intercept
