@@ -1,0 +1,12 @@
+# restuff - default runtime config
+#
+# Staged next to the executable by CMake (only when absent, so your edits here
+# survive rebuilds). Keys map to cvar names; nested [tables] join with '_'.
+# Delete the staged copy next to the exe to regenerate it from this template.
+
+# Render through the SDK's emulated Xenos GPU (runtime-loaded rexgpu-xenos
+# plugin). RestuffApp::OnPreSetup also defaults this when empty.
+gpu_plugin = "xenos"
+
+# Start windowed rather than fullscreen (the 'fullscreen' cvar defaults true).
+fullscreen = false

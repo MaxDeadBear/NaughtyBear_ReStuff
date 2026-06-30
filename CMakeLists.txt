@@ -17,7 +17,14 @@ set(RESTUFF_SOURCES
 )
 
 if(WIN32)
-    add_executable(restuff WIN32 ${RESTUFF_SOURCES})
+    # Compile DASHICON.ico into the executable so Explorer/taskbar/window use it.
+    # The .rc is generated with an absolute icon path so it resolves regardless of
+    # the build/working directory.
+    enable_language(RC)
+    set(RESTUFF_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/DASHICON.ico")
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/restuff.rc.in
+                   ${CMAKE_CURRENT_BINARY_DIR}/restuff.rc @ONLY)
+    add_executable(restuff WIN32 ${RESTUFF_SOURCES} ${CMAKE_CURRENT_BINARY_DIR}/restuff.rc)
 else()
     add_executable(restuff ${RESTUFF_SOURCES})
 endif()
