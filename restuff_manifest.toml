@@ -98,6 +98,26 @@ name = "on_get_unlockable"
 registers = ["r3"]
 after_instruction = false
 
+# DamageableComponent apply method (vtbl+0x64, sub_8284CE68) entry: r3 = the
+# component, r4 = DamageData (float amount at +16; positive = damage, negative
+# = heal). The difficulty feature rescales the amount in place before the game
+# uses it (see on_apply_damage).
+[[entrypoint.midasm_hook]]
+address = 0x8284CE68
+name = "on_apply_damage"
+registers = ["r3", "r4"]
+after_instruction = false
+
+# Native StartEscapeTimer (sub_8270AE88, behind the Lua-exposed
+# HudComponent::StartEscapeTimer): f1 = duration seconds, r4 = eEscapeType.
+# Difficulty rescales how long the player has to interrupt escapes / calls
+# for help (see on_escape_timer).
+[[entrypoint.midasm_hook]]
+address = 0x8270AE88
+name = "on_escape_timer"
+registers = ["f1", "r4"]
+after_instruction = false
+
 [[entrypoint.midasm_hook]]
 address = 0x82f47dd4
 name = "on_ctx_reg_header"

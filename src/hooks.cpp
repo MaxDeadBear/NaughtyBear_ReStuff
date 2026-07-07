@@ -21,6 +21,7 @@
 #include <timeapi.h>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
@@ -50,6 +51,17 @@ REXCVAR_DEFINE_BOOL(health_regen_debug, false, "Gameplay",
 REXCVAR_DEFINE_BOOL(health_regen_hud, true, "Gameplay",
     "Heal through the game's damage pipeline so the on-screen health bar "
     "updates. Disable for a silent field write if it misbehaves.");
+
+// --- Difficulty -------------------------------------------------------------
+// 0=Nice 1=Normal 2=Naughty 3=Nutter. Scales damage amounts in the component
+// apply hook (on_apply_damage). Chosen from the F8 panel (difficulty_overlay.h),
+// which auto-opens at the main menu; persisted to the restuff.toml next to the
+// exe so it survives restarts.
+REXCVAR_DEFINE_INT32(difficulty, 1, "Gameplay",
+    "Difficulty: 0=Nice 1=Normal 2=Naughty 3=Nutter.")
+    .range(0, 3);
+REXCVAR_DEFINE_BOOL(difficulty_debug, false, "Gameplay",
+    "Log the first difficulty damage rescales (for verifying the hook).");
 
 // Dump every loaded Lua chunk's bytecode to lua_dump/<path> (basis: lua_mods
 // branch). Use to extract the per-level medal score targets.
@@ -226,6 +238,16 @@ std::atomic<uint32_t> g_score_mgr{0};
 
 // UnlockableManager (captured from on_get_unlockable), for the unlock_all cvar.
 std::atomic<uint32_t> g_unlock_mgr{0};
+
+// Primary vtable of hazingDamage::CharacterDamageableComponent, captured from
+// the player's component in on_read_hp. Only characters (player + bears) use
+// that class -- props/destructibles are plain damage::DamageableComponent -- so
+// it lets on_apply_damage scale bears without touching props.
+std::atomic<uint32_t> g_char_vtbl{0};
+
+// Set when startmenu.lua first loads (main menu is up): cues the difficulty
+// panel to auto-open once per session.
+std::atomic<bool> g_difficulty_autoshow{false};
 
 
 
@@ -445,6 +467,10 @@ void on_read_hp(PPCRegister& r3) {
     for (uint32_t off = 0; off < 0x400; off += 4) {
         if (rd32_safe(base, comp + off, ok) == player_obj && ok) {
             g_player_idmg.store(idmg, std::memory_order_relaxed);
+            // The player's component is a hazingDamage::CharacterDamageableComponent;
+            // its primary vtable identifies every character for difficulty scaling.
+            const uint32_t vt = rd32_safe(base, comp, ok);
+            if (ok && ptr_ok(vt)) g_char_vtbl.store(vt, std::memory_order_relaxed);
             return;
         }
     }
@@ -534,6 +560,14 @@ void on_lua_load(PPCRegister& r5, PPCRegister& r6) {
     while (len < 256 && path[len]) ++len;
     const std::string key = lua_mod_key(path, len);
 
+    // First frontend load = the main menu is coming up: cue the difficulty
+    // panel to auto-open (once per session).
+    if (key.find("startmenu") != std::string::npos) {
+        static std::atomic<bool> menu_seen{false};
+        if (!menu_seen.exchange(true, std::memory_order_relaxed))
+            g_difficulty_autoshow.store(true, std::memory_order_relaxed);
+    }
+
     if (REXCVAR_GET(lua_dump_originals)) dump_lua_original(key, mem, data);
 
     const auto repl = get_lua_replacement(key);
@@ -607,6 +641,156 @@ static void maybe_unlock_all() {
         if (auto* fn = fd->GetFunction(0x826F4E78u))  // UnlockAllUnlockables(mgr, true)
             rex::ppc::GuestToHostFunction<void>(*fn, m, 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Difficulty
+// ---------------------------------------------------------------------------
+// on_apply_damage hooks the damage apply method (primary-vtable+0x64 =
+// sub_8284CE68) shared by every damage::DamageableComponent. r3 = component,
+// r4 = DamageData; the amount is a float at DamageData+16, which the function
+// itself later rescales in place for costume modifiers -- so rewriting it at
+// entry is safe and flows through the whole pipeline (HUD bar, death, msgs).
+// Positive amounts are damage, negative are heals (incl. our health regen);
+// heals are never scaled.
+
+namespace {
+
+// {player damage taken, character/bear damage taken, escape/call-for-help
+// timer duration} multipliers per level. escape_time scales the window the
+// player has to interrupt a fleeing/phoning bear (longer = easier).
+struct DiffTuning { float player_taken; float enemy_taken; float escape_time; };
+constexpr DiffTuning kDiffTuning[4] = {
+    {0.5f,  1.5f,  1.5f},   // 0 Nice    -- take half damage, bears go down faster
+    {1.0f,  1.0f,  1.0f},   // 1 Normal  -- vanilla
+    {1.5f,  0.75f, 0.8f},   // 2 Naughty
+    {2.5f,  0.5f,  0.6f},   // 3 Nutter
+};
+constexpr const char* kDiffNames[4] = {"Nice", "Normal", "Naughty", "Nutter"};
+
+}  // namespace
+
+int get_difficulty() {
+    const int d = REXCVAR_GET(difficulty);
+    return (d < 0 || d > 3) ? 1 : d;
+}
+
+const char* get_difficulty_name(int level) {
+    return (level >= 0 && level <= 3) ? kDiffNames[level] : "?";
+}
+
+// Rewrite (or append) the `difficulty = N` line in the restuff.toml staged
+// next to the exe; the runtime reads it back into the cvar at boot.
+static void persist_difficulty(int level) {
+    const std::filesystem::path path =
+        rex::filesystem::GetExecutableFolder() / "restuff.toml";
+    std::vector<std::string> lines;
+    {
+        std::ifstream in(path);
+        std::string l;
+        while (std::getline(in, l)) lines.push_back(l);
+    }
+    const std::string entry = "difficulty = " + std::to_string(level);
+    bool replaced = false;
+    for (auto& l : lines) {
+        const size_t p = l.find_first_not_of(" \t");
+        if (p == std::string::npos || l.compare(p, 10, "difficulty") != 0) continue;
+        const size_t q = l.find_first_not_of(" \t", p + 10);
+        if (q != std::string::npos && l[q] == '=') {  // not difficulty_debug etc.
+            l = entry;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        lines.push_back("");
+        lines.push_back("# Difficulty: 0=Nice 1=Normal 2=Naughty 3=Nutter (F8 panel).");
+        lines.push_back(entry);
+    }
+    std::ofstream out(path, std::ios::trunc);
+    for (const auto& l : lines) out << l << '\n';
+}
+
+void set_difficulty(int level) {
+    if (level < 0) level = 0;
+    if (level > 3) level = 3;
+    REXCVAR_SET(difficulty, level);
+    persist_difficulty(level);
+    REXLOG_INFO("[difficulty] set to {} ({})", level, kDiffNames[level]);
+}
+
+bool consume_difficulty_autoshow() {
+    return g_difficulty_autoshow.exchange(false, std::memory_order_relaxed);
+}
+
+// Midasm hook at the damage apply method entry (0x8284CE68). Scales the
+// DamageData amount by the difficulty tuning: the player's component gets
+// player_taken; other components with the player's concrete class vtable
+// (i.e. bears, not props) get enemy_taken.
+void on_apply_damage(PPCRegister& r3, PPCRegister& r4) {
+    const int diff = get_difficulty();
+    if (diff == 1) return;  // Normal = vanilla, touch nothing
+
+    const uint32_t comp = r3.u32;
+    const uint32_t dd   = r4.u32;
+    if (!ptr_ok(comp) || !ptr_ok(dd)) return;
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return;
+    uint8_t* base = mem->virtual_membase();
+    if (!base) return;
+
+    bool ok = false;
+    const uint32_t raw = rd32_safe(base, dd + 16, ok);
+    if (!ok) return;
+    float amount;
+    std::memcpy(&amount, &raw, 4);
+    // Only scale real damage: negative amounts are heals (incl. health regen).
+    if (!(amount > 0.0f) || amount > 1.0e6f) return;
+
+    const uint32_t player = g_player_idmg.load(std::memory_order_relaxed);
+    if (!player) return;  // player not captured yet -> can't classify, stay vanilla
+
+    float mul = 1.0f;
+    const char* who = nullptr;
+    if (comp + 32 == player) {
+        mul = kDiffTuning[diff].player_taken;
+        who = "player";
+    } else {
+        const uint32_t vt = rd32_safe(base, comp, ok);
+        if (ok && vt != 0 && vt == g_char_vtbl.load(std::memory_order_relaxed)) {
+            mul = kDiffTuning[diff].enemy_taken;
+            who = "bear";
+        }
+    }
+    if (!who || mul == 1.0f) return;
+
+    wr_f32(base, dd + 16, amount * mul);
+
+    if (REXCVAR_GET(difficulty_debug)) {
+        static std::atomic<uint32_t> n{0};
+        if (n.fetch_add(1, std::memory_order_relaxed) < 64)
+            REXLOG_INFO("[difficulty] {} dmg {:.1f} -> {:.1f} (x{:.2f}, {})",
+                        who, amount, amount * mul, mul, kDiffNames[diff]);
+    }
+}
+
+// Midasm hook at hazingHud escape-timer start (sub_8270AE88), the native
+// behind the script-exposed HudComponent::StartEscapeTimer(duration, type).
+// f1 = duration in seconds (comes from the Lua AI script), r4 = eEscapeType
+// (car/boat/call-police). Harder difficulties shorten the window the player
+// gets to stop an escape or a call for help; Nice lengthens it.
+// NOTE: this rescales the HUD countdown -- in-game verification must confirm
+// the gameplay outcome (cops arriving / bear escaping) tracks this timer and
+// not a separate script-side clock (watch with difficulty_debug).
+void on_escape_timer(PPCRegister& f1, PPCRegister& r4) {
+    const int diff = get_difficulty();
+    const float mul = kDiffTuning[diff].escape_time;
+    const double before = f1.f64;
+    if (mul != 1.0f && before > 0.0 && before < 3600.0)
+        f1.f64 = before * static_cast<double>(mul);
+    if (REXCVAR_GET(difficulty_debug))
+        REXLOG_INFO("[difficulty] escape timer type={} {:.1f}s -> {:.1f}s ({})",
+                    r4.u32, before, f1.f64, kDiffNames[diff]);
 }
 
 // ---------------------------------------------------------------------------

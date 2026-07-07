@@ -13,6 +13,7 @@
 
 #include "fps_overlay.h"
 #include "cheats_overlay.h"
+#include "difficulty_overlay.h"
 #include "trophy_overlay.h"
 
 class RestuffApp : public rex::ReXApp {
@@ -41,6 +42,7 @@ class RestuffApp : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     drawer->AddDialog(new FpsOverlayDialog(drawer));
     drawer->AddDialog(new CheatsDialog(drawer));
+    drawer->AddDialog(new DifficultyDialog(drawer));
     drawer->AddDialog(new TrophyOverlayDialog(drawer));
   }
 
