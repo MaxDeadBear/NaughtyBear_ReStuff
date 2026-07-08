@@ -74,6 +74,8 @@ REXCVAR_DEFINE_BOOL(unlock_all, false, "Cheats",
 static void update_health_regen(double dt);
 static void update_level_score();
 static void maybe_unlock_all();
+// Defined in the difficulty section; called from on_lua_load.
+static void patch_payphone_duration(rex::memory::Memory* mem, uint32_t data);
 
 // Set Windows timer resolution to 1ms for the lifetime of the process.
 // Default is 15.6ms which causes sleep_until to overshoot badly.
@@ -568,6 +570,12 @@ void on_lua_load(PPCRegister& r5, PPCRegister& r6) {
             g_difficulty_autoshow.store(true, std::memory_order_relaxed);
     }
 
+    // Difficulty: rescale the payphone call-for-help duration in the chunk's
+    // constant pool before Lua parses it (see patch_payphone_duration).
+    if (key.size() >= 17 &&
+        key.compare(key.size() - 17, 17, "payphone_call.lua") == 0)
+        patch_payphone_duration(mem, data);
+
     if (REXCVAR_GET(lua_dump_originals)) dump_lua_original(key, mem, data);
 
     const auto repl = get_lua_replacement(key);
@@ -776,21 +784,65 @@ void on_apply_damage(PPCRegister& r3, PPCRegister& r4) {
 
 // Midasm hook at hazingHud escape-timer start (sub_8270AE88), the native
 // behind the script-exposed HudComponent::StartEscapeTimer(duration, type).
-// f1 = duration in seconds (comes from the Lua AI script), r4 = eEscapeType
-// (car/boat/call-police). Harder difficulties shorten the window the player
-// gets to stop an escape or a call for help; Nice lengthens it.
-// NOTE: this rescales the HUD countdown -- in-game verification must confirm
-// the gameplay outcome (cops arriving / bear escaping) tracks this timer and
-// not a separate script-side clock (watch with difficulty_debug).
+// f1 = duration in seconds, r4 = eEscapeType (car/boat/call-police).
+// LOG-ONLY: verified in-game that this HUD countdown is display-only -- the
+// gameplay outcome runs on the script's own CreateTimer clock. Scaling happens
+// at the source instead (patch_payphone_duration rewrites the constant both
+// the real timer and this HUD call read), so the two always agree. Scaling
+// f1 here too would double-apply.
 void on_escape_timer(PPCRegister& f1, PPCRegister& r4) {
-    const int diff = get_difficulty();
-    const float mul = kDiffTuning[diff].escape_time;
-    const double before = f1.f64;
-    if (mul != 1.0f && before > 0.0 && before < 3600.0)
-        f1.f64 = before * static_cast<double>(mul);
     if (REXCVAR_GET(difficulty_debug))
-        REXLOG_INFO("[difficulty] escape timer type={} {:.1f}s -> {:.1f}s ({})",
-                    r4.u32, before, f1.f64, kDiffNames[diff]);
+        REXLOG_INFO("[difficulty] escape timer start: type={} {:.1f}s",
+                    r4.u32, f1.f64);
+}
+
+// Rewrite the payphone call-for-help duration inside payphone_call.lua as it
+// loads. The script stores the 22-second duration as ONE integer constant
+// (this Lua uses the LNUM patch: constant tag 0xFE + little-endian int64)
+// that feeds BOTH the authoritative script timer (CreateTimer(22, __this__,
+// "PayPhone_Call_Timer1_End")) and the HUD (StartEscapeTimer(22, ...)), so
+// patching it keeps gameplay and display in sync. The pattern occurs exactly
+// once in the chunk; a value other than 22 (already patched / changed file)
+// simply doesn't match, so reloads can't compound the scaling.
+// Car/boat escapes are left vanilla: their pacing is a fixed fumble/cutscene
+// animation chain, not a single timer.
+static void patch_payphone_duration(rex::memory::Memory* mem, uint32_t data) {
+    const int diff = get_difficulty();
+
+    // The game caches the decompressed chunk and reuses the SAME buffer on
+    // later loads (observed: double load per level, second already patched).
+    // So the constant we're looking for may hold the original 22 OR any value
+    // a previous difficulty wrote -- accept the whole candidate set and always
+    // run (Normal must restore 22 over a cached scaled value).
+    constexpr float kBase = 22.0f;
+    auto scaled = [](int d) {
+        int64_t v = static_cast<int64_t>(kBase * kDiffTuning[d].escape_time + 0.5f);
+        return v < 5 ? int64_t{5} : v;
+    };
+    const int64_t want = scaled(diff);
+
+    const uint32_t buf  = __builtin_bswap32(*mem->TranslateVirtual<const uint32_t*>(data));
+    const uint32_t size = __builtin_bswap32(*mem->TranslateVirtual<const uint32_t*>(data + 4));
+    if (!buf || !size || size > (16u << 20)) return;
+    uint8_t* p = mem->TranslateVirtual<uint8_t*>(buf);
+
+    for (uint32_t i = 0; i + 9 <= size; ++i) {
+        if (p[i] != 0xFE) continue;  // Lua int-constant tag
+        int64_t cur = 0;
+        for (int b = 7; b >= 0; --b) cur = (cur << 8) | p[i + 1 + b];  // LE int64
+        const bool known = (cur == static_cast<int64_t>(kBase)) ||
+                           cur == scaled(0) || cur == scaled(1) ||
+                           cur == scaled(2) || cur == scaled(3);
+        if (!known) continue;
+        if (cur != want) {
+            for (int b = 0; b < 8; ++b)
+                p[i + 1 + b] = static_cast<uint8_t>((want >> (8 * b)) & 0xFF);
+            REXLOG_INFO("[difficulty] payphone call duration {}s -> {}s ({})",
+                        cur, want, kDiffNames[diff]);
+        }
+        return;
+    }
+    REXLOG_WARN("[difficulty] payphone_call.lua: duration constant not found");
 }
 
 // ---------------------------------------------------------------------------

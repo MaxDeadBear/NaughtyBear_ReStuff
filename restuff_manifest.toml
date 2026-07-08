@@ -110,8 +110,9 @@ after_instruction = false
 
 # Native StartEscapeTimer (sub_8270AE88, behind the Lua-exposed
 # HudComponent::StartEscapeTimer): f1 = duration seconds, r4 = eEscapeType.
-# Difficulty rescales how long the player has to interrupt escapes / calls
-# for help (see on_escape_timer).
+# LOG-ONLY (difficulty_debug): the HUD countdown is display-only; difficulty
+# scales the payphone duration at the source instead (patch_payphone_duration
+# in on_lua_load), which feeds both the real script timer and this HUD call.
 [[entrypoint.midasm_hook]]
 address = 0x8270AE88
 name = "on_escape_timer"

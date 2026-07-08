@@ -13,6 +13,12 @@ extern const char* get_difficulty_name(int level);
 // True exactly once, when the frontend menu (startmenu.lua) first loads.
 extern bool consume_difficulty_autoshow();
 
+// Salsbury (the game's cloth-lettering font), loaded in
+// RestuffApp::OnConfigureFonts from assets/fonts/Salsbury Regular/. Baked at
+// 48px; the panel downscales it per element. nullptr = font file missing,
+// panel falls back to the default ImGui font.
+inline ImFont* g_salsbury_font = nullptr;
+
 // "Select difficulty" panel styled after the game's stitched-cloth dialogs:
 // pale-blue rounded panel with a dashed stitch border over a dimmed screen.
 // Auto-opens the first time the main menu comes up; F8 reopens it anytime.
@@ -79,7 +85,7 @@ public:
         StitchRoundedRect(dl, ImVec2(mn.x + 9, mn.y + 9), ImVec2(mx.x - 9, mx.y - 9),
                           rounding - 8.0f, kStitch, 3.0f, 11.0f, 8.0f);
 
-        ImFont* font = ImGui::GetFont();
+        ImFont* font = g_salsbury_font ? g_salsbury_font : ImGui::GetFont();
         const float title_px = Clamp(ph * 0.115f, 24.0f, 44.0f);
         const float opt_px   = Clamp(ph * 0.09f, 20.0f, 36.0f);
 
@@ -130,10 +136,11 @@ public:
             }
         }
 
-        // Footer hint.
+        // Footer hint (Salsbury too; slightly larger than the old default-font
+        // hint so the display face stays legible at footer size).
         {
             const char* t = "Enter / click to select   -   Esc to close   -   F8 reopens";
-            const float px = Clamp(ph * 0.038f, 12.0f, 16.0f);
+            const float px = Clamp(ph * 0.048f, 15.0f, 20.0f);
             const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0.0f, t);
             dl->AddText(font, px,
                         ImVec2(mn.x + (pw - ts.x) * 0.5f, mx.y - ph * 0.075f),

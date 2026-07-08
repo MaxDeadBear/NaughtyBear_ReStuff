@@ -46,6 +46,27 @@ class RestuffApp : public rex::ReXApp {
     drawer->AddDialog(new TrophyOverlayDialog(drawer));
   }
 
+  // Load Salsbury (the game's cloth-lettering font) for the difficulty panel.
+  // Runs before the atlas is built; searched with the same walk-up used for
+  // the game data root so it works from any launch directory.
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+    std::error_code ec;
+    for (std::filesystem::path base :
+         {std::filesystem::current_path(ec), rex::filesystem::GetExecutableFolder()}) {
+      for (; !base.empty(); base = base.parent_path()) {
+        const std::filesystem::path ttf = base / "assets" / "fonts" /
+                                          "Salsbury Regular" / "Salsbury Regular.ttf";
+        if (std::filesystem::exists(ttf, ec)) {
+          g_salsbury_font = atlas->AddFontFromFileTTF(ttf.string().c_str(), 48.0f);
+          return;
+        }
+        if (base == base.parent_path()) {
+          break;
+        }
+      }
+    }
+  }
+
   // Default the game data root to the project's assets folder when
   // --game_data_root isn't passed on the command line. The new SDK leaves
   // paths.game_data_root empty if no CLI arg / cvar supplied it, so without
