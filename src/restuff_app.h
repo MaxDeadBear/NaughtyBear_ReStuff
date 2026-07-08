@@ -13,7 +13,11 @@
 
 #include "fps_overlay.h"
 #include "cheats_overlay.h"
+#include "difficulty_overlay.h"
 #include "trophy_overlay.h"
+
+// hooks.cpp: save root for the new-profile watcher (difficulty auto-show).
+extern void set_user_data_root(const std::filesystem::path& p);
 
 class RestuffApp : public rex::ReXApp {
  public:
@@ -41,7 +45,29 @@ class RestuffApp : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     drawer->AddDialog(new FpsOverlayDialog(drawer));
     drawer->AddDialog(new CheatsDialog(drawer));
+    drawer->AddDialog(new DifficultyDialog(drawer));
     drawer->AddDialog(new TrophyOverlayDialog(drawer));
+  }
+
+  // Load Salsbury (the game's cloth-lettering font) for the difficulty panel.
+  // Runs before the atlas is built; searched with the same walk-up used for
+  // the game data root so it works from any launch directory.
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+    std::error_code ec;
+    for (std::filesystem::path base :
+         {std::filesystem::current_path(ec), rex::filesystem::GetExecutableFolder()}) {
+      for (; !base.empty(); base = base.parent_path()) {
+        const std::filesystem::path ttf = base / "assets" / "fonts" /
+                                          "Salsbury Regular" / "Salsbury Regular.ttf";
+        if (std::filesystem::exists(ttf, ec)) {
+          g_salsbury_font = atlas->AddFontFromFileTTF(ttf.string().c_str(), 48.0f);
+          return;
+        }
+        if (base == base.parent_path()) {
+          break;
+        }
+      }
+    }
   }
 
   // Default the game data root to the project's assets folder when
@@ -50,6 +76,9 @@ class RestuffApp : public rex::ReXApp {
   // this the exe wouldn't find Default.xex unless launched from a folder that
   // already has an assets/ next to it.
   void OnConfigurePaths(rex::PathConfig& paths) override {
+    // The new-profile watcher (difficulty auto-show) scans the save root.
+    set_user_data_root(paths.user_data_root);
+
     if (!paths.game_data_root.empty()) {
       return;  // honor an explicit --game_data_root
     }
