@@ -11,7 +11,7 @@
 
 [project]
 name = "restuff"
-sdk_version = "0.8.1"
+sdk_version = "0.8.0"
 game_root = "assets"
 
 [entrypoint]
@@ -23,6 +23,7 @@ setjmp_address  = 0x83096C10
 longjmp_address = 0x830968F0
 
 [entrypoint.functions]
+0x827CA1D0 = {}
 0x827B9630 = {}  # ctx.ctr.u32[0]
 0x827788D0 = {}  # ctx.ctr.u32[0]
 0x827B9610 = {}  # ctx.ctr.u32[0]
@@ -120,4 +121,56 @@ after_instruction = false
 address = 0x82f47778
 name = "on_ctx_reg_data"
 registers = ["r10"]
+after_instruction = false
+
+# SetBackgroundColor GAS tag Execute (sub_82CD17B0) entry. r3 = the 8-byte tag
+# object; bytes +5/+6/+7 are R/G/B. Lets on_set_bg_color rewrite the title's
+# yellow background color to blue (the main menu already uses blue).
+[[entrypoint.midasm_hook]]
+address = 0x82CD17B0
+name = "on_set_bg_color"
+registers = ["r3"]
+after_instruction = false
+
+# Char-id store in the PlaceObject2/3 parser (stw r5,0x50(r29)). r29 = the record,
+# r31 = the parser stream (identifies the movie being parsed); fires for every
+# placement. on_gfx_place buffers/recolors the felt sky records, scoped to the
+# startmenu movie via the sky_trigger_cid confirmation.
+[[entrypoint.midasm_hook]]
+address = 0x82CD682C
+name = "on_gfx_place"
+registers = ["r29", "r31"]
+after_instruction = true
+
+# After the SWF PlaceObject2/3 cxform read (bl sub_82D273F8). r29 = the record,
+# r31 = the parser stream. Re-applies the sky override after a supplied cxform
+# overwrites the record's cxform field.
+[[entrypoint.midasm_hook]]
+address = 0x82CD6868
+name = "on_gfx_cxform"
+registers = ["r29", "r31"]
+after_instruction = true
+
+# GFxPlaceObject2::Execute entry (sub_82CD1538). r3 = the tag. LOG-ONLY (see
+# on_gfx_execute) -- diagnosis of which sky tags replay at runtime.
+[[entrypoint.midasm_hook]]
+address = 0x82CD1538
+name = "on_gfx_execute"
+registers = ["r3"]
+after_instruction = false
+
+# GASColor::setRGB tail (sub_82C88130), after the 8-float cxform write into the
+# character (+44), before the dirty-notify bctrl. r30 = the character. Catches
+# runtime AS re-tints of the sky (the menu->Back yellow flash).
+[[entrypoint.midasm_hook]]
+address = 0x82C88274
+name = "on_as_setrgb"
+registers = ["r30"]
+after_instruction = false
+
+# GASColor::setTransform tail (sub_82C87B38), same contract; r26 = the character.
+[[entrypoint.midasm_hook]]
+address = 0x82C87DF4
+name = "on_as_settransform"
+registers = ["r26"]
 after_instruction = false

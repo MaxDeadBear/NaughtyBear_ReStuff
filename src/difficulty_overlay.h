@@ -17,6 +17,10 @@ extern const char* get_difficulty_name(int level);
 extern bool consume_difficulty_autoshow();
 // difficulty_enabled cvar: false = vanilla experience, panel never opens.
 extern bool get_difficulty_feature_enabled();
+// difficulty_native_prompt cvar: true = show the game's own stitched
+// UserPrompt dialog (driven from hooks.cpp) instead of this ImGui panel.
+extern bool get_difficulty_native_prompt();
+extern void request_native_difficulty_prompt();
 // While true, the guest's XamInput reads are blanked so the game menu behind
 // the panel doesn't react to the same presses (hooks.cpp).
 extern void set_guest_input_suppressed(bool on);
@@ -28,18 +32,35 @@ extern void set_guest_input_suppressed(bool on);
 inline ImFont* g_salsbury_font = nullptr;
 
 // "Select difficulty" panel styled after the game's stitched-cloth dialogs:
-// pale-blue rounded panel with a dashed stitch border over a dimmed screen.
+// the game's own blue stitched-felt plate (assets/menustuff/blueborder.png,
+// uploaded by RestuffApp) drawn over a dimmed screen; when the texture is
+// missing it falls back to the old procedural pale-blue panel + dash border.
 // Slides in from the top of the screen. Auto-opens when a new save profile is
 // created; F8 reopens it anytime. Controller (D-pad/stick + A, B closes),
 // mouse, or Up/Down + Enter picks; Esc dismisses. The stitched underline
 // marks the difficulty currently in effect.
 class DifficultyDialog : public rex::ui::ImGuiDialog {
 public:
-    explicit DifficultyDialog(rex::ui::ImGuiDrawer* drawer)
-        : rex::ui::ImGuiDialog(drawer) {
+    // panel_tex: ImmediateTexture* cast to ImTextureID (0 = procedural
+    // fallback); panel_uv0/uv1 crop the texture's transparent margins so the
+    // cloth plate fills the panel rect edge to edge. panel_aspect = cropped
+    // plate width/height — the panel keeps that shape and limits how far the
+    // plate is stretched past its native pixels so it stays sharp.
+    explicit DifficultyDialog(rex::ui::ImGuiDrawer* drawer,
+                              ImTextureID panel_tex = ImTextureID{},
+                              ImVec2 panel_uv0 = ImVec2(0.0f, 0.0f),
+                              ImVec2 panel_uv1 = ImVec2(1.0f, 1.0f),
+                              float panel_aspect = 0.0f)
+        : rex::ui::ImGuiDialog(drawer),
+          panel_tex_(panel_tex),
+          panel_uv0_(panel_uv0),
+          panel_uv1_(panel_uv1),
+          panel_aspect_(panel_aspect) {
         rex::ui::RegisterBind("bind_difficulty", "F8", "Select difficulty", [this] {
-            if (visible_)                              ClosePanel();
-            else if (get_difficulty_feature_enabled()) OpenPanel();
+            if (visible_)                                   ClosePanel();
+            else if (!get_difficulty_feature_enabled())     {}
+            else if (get_difficulty_native_prompt())        request_native_difficulty_prompt();
+            else                                            OpenPanel();
         });
     }
 
@@ -49,7 +70,10 @@ public:
     }
 
     void OnDraw(ImGuiIO& io) override {
-        if (consume_difficulty_autoshow() && !visible_) OpenPanel();
+        if (consume_difficulty_autoshow() && !visible_) {
+            if (get_difficulty_native_prompt()) request_native_difficulty_prompt();
+            else                                OpenPanel();
+        }
         if (!visible_) return;
 
         // Slide-in: ease-out cubic from above the screen to center.
@@ -64,8 +88,21 @@ public:
             vpos, ImVec2(vpos.x + vsz.x, vpos.y + vsz.y),
             IM_COL32(0, 0, 0, static_cast<int>(120 * ease)));
 
-        const float pw = Clamp(vsz.x * 0.62f, 460.0f, 920.0f);
-        const float ph = Clamp(vsz.y * 0.62f, 320.0f, 560.0f);
+        // With the plate texture, keep its native shape and don't blow it up
+        // much past its source pixels (512-class art goes soft when doubled).
+        float pw, ph;
+        if (panel_tex_ && panel_aspect_ > 0.0f) {
+            ph = Clamp(vsz.y * 0.62f, 300.0f, 500.0f);
+            pw = ph * panel_aspect_;
+            const float max_w = vsz.x * 0.55f;
+            if (pw > max_w) {
+                pw = max_w;
+                ph = pw / panel_aspect_;
+            }
+        } else {
+            pw = Clamp(vsz.x * 0.62f, 460.0f, 920.0f);
+            ph = Clamp(vsz.y * 0.62f, 320.0f, 560.0f);
+        }
         const float cy_end   = vpos.y + vsz.y * 0.5f;          // settled: centered
         const float cy_start = vpos.y - ph * 0.5f - 12.0f;     // fully off-screen top
         const float cy = cy_start + (cy_end - cy_start) * ease;
@@ -126,11 +163,17 @@ public:
         const ImVec2 mx = ImVec2(mn.x + pw, mn.y + ph);
         const float rounding = 30.0f;
 
-        // Cloth panel + stitch border.
-        dl->AddRectFilled(mn, mx, kPanelBg, rounding);
-        dl->AddRect(mn, mx, kPanelEdge, rounding, 0, 3.0f);
-        StitchRoundedRect(dl, ImVec2(mn.x + 9, mn.y + 9), ImVec2(mx.x - 9, mx.y - 9),
-                          rounding - 8.0f, kStitch, 3.0f, 11.0f, 8.0f);
+        // Cloth panel: the game's stitched felt plate when available, else the
+        // procedural rounded rect + dash border it used to draw.
+        if (panel_tex_) {
+            dl->AddImage(panel_tex_, mn, mx, panel_uv0_, panel_uv1_);
+        } else {
+            dl->AddRectFilled(mn, mx, kPanelBg, rounding);
+            dl->AddRect(mn, mx, kPanelEdge, rounding, 0, 3.0f);
+            StitchRoundedRect(dl, ImVec2(mn.x + 9, mn.y + 9),
+                              ImVec2(mx.x - 9, mx.y - 9), rounding - 8.0f,
+                              kStitch, 3.0f, 11.0f, 8.0f);
+        }
 
         ImFont* font = g_salsbury_font ? g_salsbury_font : ImGui::GetFont();
         const float title_px = Clamp(ph * 0.115f, 24.0f, 44.0f);
@@ -163,12 +206,11 @@ public:
             if (ImGui::IsItemHovered()) sel_ = i;
             ImGui::PopID();
 
+            // Selection = white text (dark shadow keeps it readable on the
+            // pale cloth); everything else stays the stitched blue.
             const bool hot = (sel_ == i);
-            if (hot)
-                dl->AddRectFilled(ImVec2(p.x - 24, p.y - 6),
-                                  ImVec2(p.x + ts.x + 24, p.y + ts.y + 6),
-                                  kHotBg, 12.0f);
-            dl->AddText(font, opt_px, ImVec2(p.x + 2, p.y + 2), kTextShadow, t);
+            dl->AddText(font, opt_px, ImVec2(p.x + 2, p.y + 2),
+                        hot ? kTextHotShadow : kTextShadow, t);
             dl->AddText(font, opt_px, p, hot ? kTextHot : kText, t);
 
             // Stitched underline marks the difficulty currently in effect.
@@ -183,17 +225,6 @@ public:
             }
         }
 
-        // Footer hint (Salsbury too; slightly larger than the old default-font
-        // hint so the display face stays legible at footer size).
-        {
-            const char* t = "A / Enter to select   -   B / Esc to close   -   F8 reopens";
-            const float px = Clamp(ph * 0.048f, 15.0f, 20.0f);
-            const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0.0f, t);
-            dl->AddText(font, px,
-                        ImVec2(mn.x + (pw - ts.x) * 0.5f, mx.y - ph * 0.075f),
-                        kTextFaint, t);
-        }
-
         ImGui::End();
     }
 
@@ -206,6 +237,10 @@ private:
     uint16_t pad_prev_ = 0;     // last frame's pad buttons (edge detection)
     float    hold_ = 0.0f;      // dpad hold time (auto-repeat)
     float    repeat_ = 0.0f;
+    ImTextureID panel_tex_{};   // blueborder.png upload (0 = draw procedural)
+    ImVec2   panel_uv0_{0.0f, 0.0f};
+    ImVec2   panel_uv1_{1.0f, 1.0f};
+    float    panel_aspect_ = 0.0f;  // cropped plate w/h (0 = no texture)
 
     void OpenPanel() {
         visible_ = true;
@@ -244,11 +279,10 @@ private:
     static constexpr ImU32 kPanelBg    = IM_COL32(213, 237, 244, 252);
     static constexpr ImU32 kPanelEdge  = IM_COL32(74, 163, 199, 255);
     static constexpr ImU32 kStitch     = IM_COL32(58, 145, 185, 220);
-    static constexpr ImU32 kText       = IM_COL32(23, 111, 156, 255);
-    static constexpr ImU32 kTextHot    = IM_COL32(6, 76, 116, 255);
-    static constexpr ImU32 kTextFaint  = IM_COL32(23, 111, 156, 140);
-    static constexpr ImU32 kTextShadow = IM_COL32(255, 255, 255, 110);
-    static constexpr ImU32 kHotBg      = IM_COL32(255, 255, 255, 90);
+    static constexpr ImU32 kText          = IM_COL32(23, 111, 156, 255);
+    static constexpr ImU32 kTextHot       = IM_COL32(255, 255, 255, 255);
+    static constexpr ImU32 kTextShadow    = IM_COL32(255, 255, 255, 110);
+    static constexpr ImU32 kTextHotShadow = IM_COL32(6, 76, 116, 170);
 
     static float Clamp(float v, float lo, float hi) {
         return v < lo ? lo : (v > hi ? hi : v);

@@ -75,11 +75,37 @@ REXCVAR_DEFINE_BOOL(lua_dump_originals, false, "Modding",
 REXCVAR_DEFINE_BOOL(unlock_all, false, "Cheats",
     "Unlock all costumes/content (calls UnlockAllUnlockables continuously).");
 
+// --- Title/attract sky recolor ----------------------------------------------
+// The felt menus set a per-screen background color via a "SetBackgroundColor"
+// GAS tag (Execute = sub_82CD17B0). The title/attract screen uses a yellow
+// background; the main menu uses blue (which is why the sky "turns blue on
+// start"). on_set_bg_color rewrites the yellow tag to a tunable blue.
+REXCVAR_DEFINE_BOOL(sky_recolor, true, "Modding",
+    "Recolor the yellow title/attract background to blue (SetBackgroundColor tag).");
+REXCVAR_DEFINE_BOOL(sky_recolor_debug, true, "Modding",
+    "Log every SetBackgroundColor RGB (for finding/tuning the title color).");
+REXCVAR_DEFINE_INT32(sky_r, 186, "Modding",
+    "Title sky replacement red (0-255). Default #BAD5F4, the artwork's own "
+    "light felt blue.").range(0, 255);
+REXCVAR_DEFINE_INT32(sky_g, 213, "Modding",
+    "Title sky replacement green (0-255).").range(0, 255);
+REXCVAR_DEFINE_INT32(sky_b, 244, "Modding",
+    "Title sky replacement blue (0-255).").range(0, 255);
+REXCVAR_DEFINE_INT32(sky_cid, 13, "Modding",
+    "First Scaleform character id of the felt sky shapes (-1 = off). The sky is "
+    "cids 13..15: base, day layer, warm overlay.").range(-1, 65535);
+REXCVAR_DEFINE_INT32(sky_cid2, 15, "Modding",
+    "Last Scaleform character id of the felt sky shapes (inclusive).").range(-1, 65535);
+REXCVAR_DEFINE_INT32(sky_cid_art, 14, "Modding",
+    "Char id of the pre-composited title artwork bitmap (tint stripped instead "
+    "of solid-filled so its texture survives; -1 = none).").range(-1, 65535);
+
 // Defined below on_swap; called once per presented frame.
 static void update_health_regen(double dt);
 static void update_level_score();
 static void maybe_unlock_all();
 static void watch_new_profile();
+static void update_native_difficulty_prompt();
 // Defined in the difficulty section; called from on_lua_load.
 static void patch_payphone_duration(rex::memory::Memory* mem, uint32_t data);
 
@@ -151,6 +177,9 @@ void on_swap() {
 
     // Auto-open the difficulty panel when a new save profile is created.
     watch_new_profile();
+
+    // Open/track the native (game-dialog) difficulty prompt when requested.
+    update_native_difficulty_prompt();
 }
 
 double get_fps() { return s_fps_display; }
@@ -737,6 +766,145 @@ bool consume_difficulty_autoshow() {
     return g_difficulty_autoshow.exchange(false, std::memory_order_relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// Native difficulty prompt — the game's own stitched UserPrompt dialog.
+// ---------------------------------------------------------------------------
+// Drives hazingGameStates' UserPrompt exactly like globalmenu.lua's
+// ShowUserPrompt does, but from C++ via guest calls (no Lua execution).
+// Guest natives (Default.xex; resolved from the SWIG wrappers):
+//   GameStateUtil::GetGSUserPrompt()                       = 0x827CB440 -> GSUserPrompt*
+//   GSUserPrompt::PushUserPrompt(gs)                       = 0x827EABE0 -> UserPromptInfo*
+//   UserPromptInfo::SetUserPrompt(info,msg,cb,acc,can,b)   = 0x827D2AB8
+//   UserPromptInfo::AddUserPromptChoice(info,text,idx1..n) = 0x827E32B8
+//   UserPromptInfo::SetUserPromptInputVisibility(info,b,b) = 0x827CB5F8
+//   GameStateUtil::PushUserPrompt()  [static: opens state] = 0x827CDEE0
+//   GSUserPrompt::EnableUserPromptInput(gs,bool)           = 0x827CCD10
+//   GSUserPrompt::GetCurrentUserPrompt(gs)                 = 0x827CF3E8 -> info|0
+//   UserPromptInfo selected/default choice                 = u32 at info+112
+//     (SetDefaultChoice is inlined in its wrapper as *(info+112)=idx)
+// Reply routing: the engine dispatches to the Lua global named in
+// SetUserPrompt arg2 ("OnGlobalUserPromptReply", stock), which on accept calls
+// the global named by arg3 — we pass "HideUserPrompt" (stock: pops the prompt)
+// and "" for cancel (B does nothing). We poll info+112 while the prompt is up
+// and apply the last selection when it closes.
+
+REXCVAR_DEFINE_BOOL(difficulty_native_prompt, true, "Gameplay",
+    "Show the difficulty picker as the game's own stitched dialog instead of "
+    "the ImGui panel.");
+
+bool get_difficulty_native_prompt() { return REXCVAR_GET(difficulty_native_prompt); }
+
+static std::atomic<bool> g_native_prompt_request{false};
+
+void request_native_difficulty_prompt() {
+    g_native_prompt_request.store(true, std::memory_order_relaxed);
+}
+
+// Guest-resident NUL-terminated copy of s (cached; strings live forever).
+static uint32_t guest_cstring(const char* s) {
+    static std::mutex m;
+    static std::unordered_map<std::string, uint32_t> cache;
+    std::lock_guard<std::mutex> lock(m);
+    auto it = cache.find(s);
+    if (it != cache.end()) return it->second;
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return 0;
+    const size_t len = std::strlen(s) + 1;
+    const uint32_t addr = mem->SystemHeapAlloc(static_cast<uint32_t>(len), 0x20);
+    if (addr) std::memcpy(mem->TranslateVirtual<char*>(addr), s, len);
+    cache.emplace(s, addr);
+    return addr;
+}
+
+static void update_native_difficulty_prompt() {
+    static uint32_t open_info = 0;  // our UserPromptInfo while the prompt is up
+    static int last_sel = 0;        // 1-based choice index last seen selected
+    static int defer_frames = 0;    // frames spent waiting for the prompt slot
+
+    const bool requested = g_native_prompt_request.exchange(false);
+    if (!requested && !open_info) return;
+
+    auto* fd = rex::Runtime::instance()->function_dispatcher();
+    auto* mem = rex::system::kernel_memory();
+    if (!fd || !mem) return;
+    uint8_t* base = mem->virtual_membase();
+    auto* fn_get_gs = fd->GetFunction(0x827CB440u);
+    auto* fn_cur = fd->GetFunction(0x827CF3E8u);
+    if (!base || !fn_get_gs || !fn_cur) return;
+
+    const uint32_t gs = rex::ppc::GuestToHostFunction<uint32_t>(*fn_get_gs);
+    if (!ptr_ok(gs)) return;
+    const uint32_t cur = rex::ppc::GuestToHostFunction<uint32_t>(*fn_cur, gs);
+
+    if (requested && !open_info) {
+        if (cur != 0) {
+            // Another prompt is up (on new-profile creation the save flow's own
+            // prompts are still open when the autoshow fires). DEFER instead of
+            // dropping: re-arm the request and try again next frame, so the
+            // difficulty dialog appears the moment the game's prompts close.
+            // Cap the wait so a stale request can't linger forever.
+            if (++defer_frames < 1800) {  // ~30s at 60fps
+                g_native_prompt_request.store(true, std::memory_order_relaxed);
+            } else {
+                defer_frames = 0;
+                if (REXCVAR_GET(difficulty_debug))
+                    REXLOG_INFO("[difficulty] native prompt request expired (prompt busy)");
+            }
+            return;
+        }
+        defer_frames = 0;
+        auto* fn_push   = fd->GetFunction(0x827EABE0u);
+        auto* fn_set    = fd->GetFunction(0x827D2AB8u);
+        auto* fn_choice = fd->GetFunction(0x827E32B8u);
+        auto* fn_vis    = fd->GetFunction(0x827CB5F8u);
+        auto* fn_state  = fd->GetFunction(0x827CDEE0u);
+        auto* fn_input  = fd->GetFunction(0x827CCD10u);
+        if (!fn_push || !fn_set || !fn_choice || !fn_vis || !fn_state || !fn_input)
+            return;
+        const uint32_t msg = guest_cstring("Select difficulty");
+        const uint32_t cb  = guest_cstring("OnGlobalUserPromptReply");
+        const uint32_t acc = guest_cstring("HideUserPrompt");
+        const uint32_t can = guest_cstring("");
+        if (!msg || !cb || !acc || !can) return;
+
+        const uint32_t info = rex::ppc::GuestToHostFunction<uint32_t>(*fn_push, gs);
+        if (!ptr_ok(info)) return;
+        rex::ppc::GuestToHostFunction<void>(*fn_set, info, msg, cb, acc, can, 1);
+        for (int i = 0; i < 4; ++i)
+            rex::ppc::GuestToHostFunction<void>(*fn_choice, info,
+                                                guest_cstring(kDiffNames[i]),
+                                                static_cast<uint32_t>(i + 1));
+        last_sel = get_difficulty() + 1;
+        *reinterpret_cast<uint32_t*>(base + info + 112) =
+            __builtin_bswap32(static_cast<uint32_t>(last_sel));
+        // Mirrors ShowUserPrompt: (cancel_name == "", accept_name == "").
+        rex::ppc::GuestToHostFunction<void>(*fn_vis, info, 1, 0);
+        rex::ppc::GuestToHostFunction<void>(*fn_state);
+        rex::ppc::GuestToHostFunction<void>(*fn_input, gs, 1);
+        open_info = info;
+        if (REXCVAR_GET(difficulty_debug))
+            REXLOG_INFO("[difficulty] native prompt opened: info={:08X}", info);
+        return;
+    }
+
+    if (open_info) {
+        if (cur == open_info) {
+            const uint32_t sel = rd32(base, open_info + 112);
+            if (sel >= 1 && sel <= 4 && static_cast<int>(sel) != last_sel) {
+                last_sel = static_cast<int>(sel);
+                if (REXCVAR_GET(difficulty_debug))
+                    REXLOG_INFO("[difficulty] native prompt selection -> {}", sel);
+            }
+        } else {
+            // Closed (accept ran the stock HideUserPrompt) — apply the choice.
+            open_info = 0;
+            if (REXCVAR_GET(difficulty_debug))
+                REXLOG_INFO("[difficulty] native prompt closed, sel={}", last_sel);
+            set_difficulty(last_sel - 1);
+        }
+    }
+}
+
 // --- New-profile detection --------------------------------------------------
 // The frontend's "create new saved game" flow (startmenu.lua:
 // OnSaveGameCreatePromptReplyAccept -> OnNewSavedGameCreatedSuccessfully)
@@ -915,6 +1083,353 @@ void on_escape_timer(PPCRegister& f1, PPCRegister& r4) {
     if (REXCVAR_GET(difficulty_debug))
         REXLOG_INFO("[difficulty] escape timer start: type={} {:.1f}s",
                     r4.u32, f1.f64);
+}
+
+// Midasm hook at the SetBackgroundColor GAS tag's Execute (sub_82CD17B0). r3 is
+// the 8-byte tag object; bytes +5/+6/+7 are R/G/B (the tag's describe method
+// sub_82CD2DC8 prints "SetBackgroundColor: (%d %d %d)" from tag[5..7], and the
+// Execute assembles ARGB from *(uint32*)(tag+4) and applies it to the screen via
+// sub_82CDABB8). The title/attract screen sets a yellow background; the main
+// menu sets blue. Rewrite the yellow tag to the cvar-defined blue so the title
+// sky matches. Runs at menu speed (not per-draw), so the cost is irrelevant.
+void on_set_bg_color(PPCRegister& r3) {
+    const uint32_t tag = r3.u32;
+    if (!ptr_ok(tag)) return;
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return;
+    uint8_t* base = mem->virtual_membase();
+    if (!base || !host_readable(base, tag)) return;
+
+    uint8_t* p = base + tag;  // tag < 0xC0000000 (ptr_ok), so no high-range offset
+    const int R = p[5], G = p[6], B = p[7];
+
+    if (REXCVAR_GET(sky_recolor_debug)) {
+        static std::atomic<uint32_t> n{0};
+        if (n.fetch_add(1, std::memory_order_relaxed) < 64)
+            REXLOG_INFO("[sky] SetBackgroundColor rgb=({},{},{})", R, G, B);
+    }
+
+    if (!REXCVAR_GET(sky_recolor)) return;
+    // Yellow = high red & green, low blue. The title is ~(250,230,66); the blue
+    // menu (B > R) is left untouched.
+    const bool yellowish = R >= 170 && G >= 130 && B <= 150 &&
+                           R >= B + 40 && G >= B + 30;
+    if (!yellowish) return;
+
+    auto clamp8 = [](int v) -> uint8_t {
+        return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+    };
+    p[5] = clamp8(REXCVAR_GET(sky_r));
+    p[6] = clamp8(REXCVAR_GET(sky_g));
+    p[7] = clamp8(REXCVAR_GET(sky_b));
+}
+
+// --- Title sky recolor (Scaleform) ------------------------------------------
+// The felt title scene is a Scaleform (GFx) movie. The sky is two solid-fill
+// shapes: base `sky_cid` (13) under a warm overlay `sky_cid2` (15). The title
+// draws them with a yellow baked fill; the main menu re-tints them blue via the
+// timeline. We force both to a blue solid cxform (mul=0, add=(sky_r,g,b)).
+//
+// The cxform of a GFxPlaceObject2 tag lives at record+12 as 8 big-endian floats
+// [Rmul,Radd,Gmul,Gadd,Bmul,Badd,Amul,Aadd] (out = src*mul + add); char id =
+// u16 at +82, depth = u32 at +76, "has cxform" flag byte at +87, mode dword at
+// +92 (0=place, 1=move, 2=replace).
+//
+// Recoloring must be PERMANENT (menu->Back replays the same tag records, so a
+// one-time rewrite of the records at parse sticks for the whole session) and
+// must not touch other movies -- boot logos / loading screens / HUD reuse the
+// same low char ids for logos, text, and the loading-icon outline.
+//
+// Movie scoping BY NAME (all other schemes failed in testing: a game-state gate
+// misses the parse (startmenu parses at boot, before its state activates);
+// depth-matching MOVE tags hijacks unrelated fade animations; a late trigger
+// cid (245) both arrives after the streamed intro already placed the sky AND
+// turned out to also exist in NBPlayerHud). The parser stream's loader context
+// (stream - 28) holds the movie's NAME at +0x280 -- verified live: "StartMenu",
+// "SavingIcon", "popup", "NBPlayerHud", "button_images", "GFxFontLib_Glyphs".
+// Matching "StartMenu" identifies the right movie at its FIRST tag, before the
+// sky executes, so the records are blue from the first frame shown.
+inline bool stream_is_startmenu(uint8_t* base, uint32_t stream) {
+    if (stream < 28u) return false;
+    bool ok = false;
+    const uint32_t p = rd32_safe(base, stream - 28u + 0x280u, ok);
+    if (!ok || !ptr_ok(p) || !host_readable(base, p) || !host_readable(base, p + 9))
+        return false;
+    static const char kName[] = "StartMenu";
+    for (int i = 0; i < 9; ++i)
+        if (static_cast<char>(base[p + i]) != kName[i]) return false;
+    return base[p + 9] == 0;  // exact match only
+}
+
+// Inclusive cid range [sky_cid .. sky_cid2]. The sky is three stacked shapes
+// (13 base / 14 day layer / 15 warm overlay) -- dropping 14 leaves the settled
+// title yellow. Safe as a range because the name scoping below already limits
+// the rewrite to the StartMenu movie.
+inline bool is_sky_cid(int cid) {
+    const int lo = REXCVAR_GET(sky_cid);
+    if (lo < 0) return false;
+    int hi = REXCVAR_GET(sky_cid2);
+    if (hi < lo) hi = lo;
+    return cid >= lo && cid <= hi;
+}
+// Write a blue solid-fill cxform (mul=0, add=blue) into a tag record and mark it
+// present so Execute applies it.
+inline void apply_sky_blue(uint8_t* base, uint32_t rec) {
+    auto clampf = [](int v) -> float {
+        return static_cast<float>(v < 0 ? 0 : (v > 255 ? 255 : v));
+    };
+    base[rec + 87] = 1;
+    wr_f32(base, rec + 12, 0.f);                          // R mul
+    wr_f32(base, rec + 20, 0.f);                          // G mul
+    wr_f32(base, rec + 28, 0.f);                          // B mul
+    wr_f32(base, rec + 16, clampf(REXCVAR_GET(sky_r)));   // R add
+    wr_f32(base, rec + 24, clampf(REXCVAR_GET(sky_g)));   // G add
+    wr_f32(base, rec + 32, clampf(REXCVAR_GET(sky_b)));   // B add
+    wr_f32(base, rec + 36, 1.f);                          // A mul (keep alpha)
+    wr_f32(base, rec + 40, 0.f);                          // A add
+}
+// Neutralize a warm tint on TEXTURED content: identity color channels (the
+// warm cast disappears and the artwork's native colors show through -- the
+// title-scene bitmap has a BLUE sky baked in). Alpha pair untouched so fade
+// animations survive. A solid fill here would flatten the texture into a
+// featureless blue sheet (verified user-visible regression).
+inline void apply_sky_identity(uint8_t* base, uint32_t rec) {
+    base[rec + 87] = 1;
+    wr_f32(base, rec + 12, 1.f);   // R mul
+    wr_f32(base, rec + 20, 1.f);   // G mul
+    wr_f32(base, rec + 28, 1.f);   // B mul
+    wr_f32(base, rec + 16, 0.f);   // R add
+    wr_f32(base, rec + 24, 0.f);   // G add
+    wr_f32(base, rec + 32, 0.f);   // B add
+}
+// True for the warm day-sky tint cxform: a strongly warm ADD term (high red,
+// low blue). The title's yellow is NOT a solid fill -- it's cid 14 placed with
+// mul=(0.50,0.61,0.12) add=(176,111,23) over the blue felt, and the timeline
+// carries the SAME cxform in a cid-less MOVE record that navigating back from
+// the menu replays (the verified cause of the Back->yellow revert). Matching on
+// the add term alone catches both. Non-matches by construction: menu blue
+// add=(102,153,255) (B high), boot creams (B ~ 230), bear tints add=(255,-26,0)
+// (G negative) / (41,20,0) (R low), fade ramps add=(x,x,x) gray.
+static inline bool warm_tint_cxform(uint8_t* base, uint32_t rec) {
+    const float ar = rd_f32(base, rec + 16), ag = rd_f32(base, rec + 24),
+                ab = rd_f32(base, rec + 32);
+    const float mr = rd_f32(base, rec + 12), mg = rd_f32(base, rec + 20),
+                mb = rd_f32(base, rec + 28);
+    // YELLOW-specific, not merely "warm": the day tint keeps GREEN close to RED
+    // (add G/R = 111/176 = 0.63; mul G=0.61 >= R=0.50), whereas the scene-
+    // transition RED overlay crushes green -- an earlier warm-only predicate
+    // recolored that overlay blue (user-visible regression). Both rules below
+    // require green ~ red.
+    // Full day tint: strongly warm add with G >= 0.55*R.
+    if (ar >= 150.f && ag >= 80.f && ab <= 80.f && (ar - ab) >= 100.f &&
+        ag >= 0.55f * ar)
+        return true;
+    // Tween ramp frames (the yellow flash on menu->Back): blue MUL crushed while
+    // green mul stays >= red mul (yellow keeps G; red overlays crush it). Still
+    // excluded: yellow-BEAR tint mul=(.6,.6,.6) (equal channels -> mr-mb=0),
+    // fades (gray), cool/negative tints.
+    return (mr - mb) >= 0.10f && (mg - mb) >= 0.08f && mg >= mr - 0.02f &&
+           ab <= ar && ab <= 80.f;
+}
+
+// Parse-time, name-scoped: recolor a record iff the movie being parsed is the
+// StartMenu movie AND it is either a sky-cid placement or a warm-tint re-tint
+// (the day-sky MOVE tags). Stateless -- the name is re-read per matching record
+// (a handful of byte reads at a rare event), so stream-address reuse across
+// movie loads can't confuse it.
+static inline void force_sky_cxform(uint8_t* base, uint32_t rec, uint32_t stream) {
+    if (!REXCVAR_GET(sky_recolor)) return;
+    const int cid = (base[rec + 82] << 8) | base[rec + 83];
+    bool warm = false;
+    if (!is_sky_cid(cid)) {
+        warm = warm_tint_cxform(base, rec);
+        if (!warm) return;
+    }
+    if (!stream_is_startmenu(base, stream)) return;
+    if (REXCVAR_GET(sky_recolor_debug))
+        REXLOG_INFO("[sky] recolored {} cid={} mul=({:.2f},{:.2f},{:.2f}) add=({:.0f},{:.0f},{:.0f})",
+                    warm ? "warm-tint" : "sky-cid", cid,
+                    rd_f32(base, rec + 12), rd_f32(base, rec + 20), rd_f32(base, rec + 28),
+                    rd_f32(base, rec + 16), rd_f32(base, rec + 24), rd_f32(base, rec + 32));
+    // cid 14 is the pre-composited title ARTWORK BITMAP (blue sky baked in),
+    // shown yellow only via a warm tint; strip the tint (identity) so the
+    // artwork keeps its texture. Same for cid-less warm-tint records (they tint
+    // that bitmap). Only the felt SHAPES (13, 15) take the solid menu blue.
+    if (warm || cid == REXCVAR_GET(sky_cid_art))
+        apply_sky_identity(base, rec);
+    else
+        apply_sky_blue(base, rec);
+}
+
+// --- ActionScript Color re-tints (the menu->Back yellow flash) ---------------
+// The Back transition re-yellows the sky at RUNTIME via AS2 Color.setTransform
+// (a scripted tween writes the sky's color per frame), which is invisible to
+// the parse hooks. Both Color.setRGB (sub_82C88130) and Color.setTransform
+// (sub_82C87B38) converge on writing 8 floats into the target character at +44
+// ([mul,add] pairs for 3 color channels + alpha; R/B channel order unconfirmed,
+// so both orientations are tested) followed by a dirty-notify virtual. Hooked
+// right before that notify, after the write. Same yellow-only discriminators as
+// the parse predicate, so red overlays / cool tints are untouched.
+static inline void as_color_fixup(uint8_t* base, uint32_t chr) {
+    if (!REXCVAR_GET(sky_recolor)) return;
+    if (!ptr_ok(chr) || !host_readable(base, chr + 44) ||
+        !host_readable(base, chr + 75))
+        return;
+    float f[8];
+    for (int i = 0; i < 8; ++i) f[i] = rd_f32(base, chr + 44 + 4 * i);
+    if (REXCVAR_GET(sky_recolor_debug)) {
+        static std::atomic<uint32_t> n{0};
+        if (n.fetch_add(1, std::memory_order_relaxed) < 400)
+            REXLOG_INFO("[as] chr={:08X} cx=({:.2f},{:.0f})({:.2f},{:.0f})({:.2f},{:.0f})({:.2f},{:.0f})",
+                        chr, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+    }
+    auto yellow = [](float mr, float ar, float mg, float ag, float mb, float ab) {
+        if (ar >= 150.f && ag >= 80.f && ab <= 80.f && (ar - ab) >= 100.f &&
+            ag >= 0.55f * ar)
+            return true;
+        return (mr - mb) >= 0.10f && (mg - mb) >= 0.08f && mg >= mr - 0.02f &&
+               ab <= ar && ab <= 80.f;
+    };
+    const bool ordA = yellow(f[0], f[1], f[2], f[3], f[4], f[5]);   // [R G B]
+    const bool ordB = !ordA &&
+                      yellow(f[4], f[5], f[2], f[3], f[0], f[1]);   // [B G R]
+    if (!ordA && !ordB) return;
+    // Neutralize to IDENTITY (order-independent): the tinted content is the
+    // title artwork bitmap whose native sky is already blue, so stripping the
+    // warm tint both fixes the color and keeps the texture. Alpha pair (f[6],
+    // f[7]) untouched: the tween's fade stays intact.
+    wr_f32(base, chr + 44, 1.f);   // c0 mul
+    wr_f32(base, chr + 52, 1.f);   // c1 mul
+    wr_f32(base, chr + 60, 1.f);   // c2 mul
+    wr_f32(base, chr + 48, 0.f);   // c0 add
+    wr_f32(base, chr + 56, 0.f);   // c1 add
+    wr_f32(base, chr + 64, 0.f);   // c2 add
+    if (REXCVAR_GET(sky_recolor_debug))
+        REXLOG_INFO("[as] neutralized yellow AS re-tint (order {})", ordA ? "RGB" : "BGR");
+}
+
+// Midasm hooks at the tails of GASColor::setRGB (0x82C88274, char in r30) and
+// GASColor::setTransform (0x82C87DF4, char in r26), after the cxform write and
+// before the dirty-notify call.
+void on_as_setrgb(PPCRegister& r30) {
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return;
+    uint8_t* base = mem->virtual_membase();
+    if (base) as_color_fixup(base, r30.u32);
+}
+void on_as_settransform(PPCRegister& r26) {
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return;
+    uint8_t* base = mem->virtual_membase();
+    if (base) as_color_fixup(base, r26.u32);
+}
+
+// Hook at the char-id store in the PlaceObject2/3 parser (0x82CD682C). r29 = the
+// record, r31 = the parser stream (identifies which movie is being parsed);
+// fires for EVERY placement (including the title's baked, cxform-less sky
+// placement), so this is where the sky records are collected/recolored.
+void on_gfx_place(PPCRegister& r29, PPCRegister& r31) {
+    const uint32_t rec = r29.u32;
+    if (!ptr_ok(rec)) return;
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return;
+    uint8_t* base = mem->virtual_membase();
+    if (!base || !host_readable(base, rec) || !host_readable(base, rec + 88)) return;
+
+    if (REXCVAR_GET(sky_recolor_debug)) {
+        const uint16_t cid = static_cast<uint16_t>((base[rec + 82] << 8) | base[rec + 83]);
+        if (cid != 0) {
+            static std::atomic<uint32_t> n{0};
+            if (n.fetch_add(1, std::memory_order_relaxed) < 300)
+                REXLOG_INFO("[pl] s={:08X} cid={}", r31.u32, cid);
+        }
+        // On each NEW stream, scan the loader context (stream-28) for pointers
+        // to ASCII strings -- hunting the movie filename offset so the recolor
+        // can identify the startmenu movie at parse START (streamed playback
+        // places the sky before the late cid-245 trigger arrives).
+        static uint32_t last_scanned = 0;
+        const uint32_t stream = r31.u32;
+        if (stream != last_scanned && stream >= 28u) {
+            last_scanned = stream;
+            const uint32_t ctx = stream - 28u;
+            static std::atomic<uint32_t> scans{0};
+            if (scans.fetch_add(1, std::memory_order_relaxed) < 12) {
+                for (uint32_t off = 0; off < 0x300; off += 4) {
+                    bool ok = false;
+                    const uint32_t p = rd32_safe(base, ctx + off, ok);
+                    if (!ok || !ptr_ok(p) || !host_readable(base, p) ||
+                        !host_readable(base, p + 63))
+                        continue;
+                    char buf[64];
+                    int len = 0;
+                    for (; len < 63; ++len) {
+                        const char c = static_cast<char>(base[p + len]);
+                        if (c == 0) break;
+                        if (c < 0x20 || c > 0x7e) { len = -1; break; }
+                        buf[len] = c;
+                    }
+                    if (len >= 4 && len < 63) {
+                        buf[len] = 0;
+                        REXLOG_INFO("[nm] s={:08X} ctx+{:03X} -> \"{}\"", stream, off, buf);
+                    }
+                }
+            }
+        }
+    }
+    force_sky_cxform(base, rec, r31.u32);
+}
+
+// Hook after the PlaceObject2/3 cxform read (0x82CD6868). r29 = record, r31 =
+// parser stream. Re-applies the sky override in case a supplied cxform
+// overwrote the placement-time injection (tag layout: cxform read after cid).
+void on_gfx_cxform(PPCRegister& r29, PPCRegister& r31) {
+    const uint32_t rec = r29.u32;
+    if (!ptr_ok(rec)) return;
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return;
+    uint8_t* base = mem->virtual_membase();
+    if (!base || !host_readable(base, rec) || !host_readable(base, rec + 88)) return;
+
+    if (REXCVAR_GET(sky_recolor_debug)) {
+        const uint16_t cid = static_cast<uint16_t>((base[rec + 82] << 8) | base[rec + 83]);
+        float cx[8];
+        for (int i = 0; i < 8; ++i) cx[i] = rd_f32(base, rec + 12 + 4 * i);
+        const bool ident = cx[0] == 1.f && cx[2] == 1.f && cx[4] == 1.f &&
+                           cx[1] == 0.f && cx[3] == 0.f && cx[5] == 0.f;
+        if (is_sky_cid(cid) || !ident) {
+            static std::atomic<uint32_t> n{0};
+            if (n.fetch_add(1, std::memory_order_relaxed) < 220)
+                REXLOG_INFO("[cx] s={:08X} cid={} mul=({:.2f},{:.2f},{:.2f}) add=({:.0f},{:.0f},{:.0f}){}",
+                            r31.u32, cid, cx[0], cx[2], cx[4], cx[1], cx[3], cx[5],
+                            is_sky_cid(cid) ? " <-SKY" : "");
+        }
+    }
+    force_sky_cxform(base, rec, r31.u32);
+}
+
+// Midasm hook at GFxPlaceObject2::Execute entry (sub_82CD1538). r3 = the tag.
+// LOG-ONLY: rewriting tags here by depth hijacked unrelated per-frame fade
+// animations (depth values are reused by every movie), so the recolor happens
+// exclusively at parse (stream-scoped, above). Kept for diagnosis: shows which
+// sky tags replay at runtime (e.g. on menu->Back).
+void on_gfx_execute(PPCRegister& r3) {
+    if (!REXCVAR_GET(sky_recolor_debug)) return;
+    const uint32_t tag = r3.u32;
+    if (!ptr_ok(tag)) return;
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return;
+    uint8_t* base = mem->virtual_membase();
+    if (!base || !host_readable(base, tag) || !host_readable(base, tag + 96)) return;
+
+    const uint32_t mode = rd32(base, tag + 92);
+    const int      cid  = (base[tag + 82] << 8) | base[tag + 83];
+    if ((mode != 1u && is_sky_cid(cid)) || warm_tint_cxform(base, tag)) {
+        static std::atomic<uint32_t> n{0};
+        if (n.fetch_add(1, std::memory_order_relaxed) < 200)
+            REXLOG_INFO("[ex] m={} cid={} d={} add=({:.0f},{:.0f},{:.0f})",
+                        mode, cid, rd32(base, tag + 76), rd_f32(base, tag + 16),
+                        rd_f32(base, tag + 24), rd_f32(base, tag + 32));
+    }
 }
 
 // Rewrite the payphone call-for-help duration inside payphone_call.lua as it
