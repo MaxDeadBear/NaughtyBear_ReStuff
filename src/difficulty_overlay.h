@@ -1,6 +1,9 @@
 #pragma once
 #include <cfloat>
 #include <cmath>
+#include <rex/input/input.h>
+#include <rex/input/input_system.h>
+#include <rex/runtime.h>
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/keybinds.h>
 #include "imgui.h"
@@ -10,8 +13,17 @@
 extern int  get_difficulty();
 extern void set_difficulty(int level);
 extern const char* get_difficulty_name(int level);
-// True exactly once, when the frontend menu (startmenu.lua) first loads.
+// True exactly once, when a new save profile is created this session.
 extern bool consume_difficulty_autoshow();
+// difficulty_enabled cvar: false = vanilla experience, panel never opens.
+extern bool get_difficulty_feature_enabled();
+// difficulty_native_prompt cvar: true = show the game's own stitched
+// UserPrompt dialog (driven from hooks.cpp) instead of this ImGui panel.
+extern bool get_difficulty_native_prompt();
+extern void request_native_difficulty_prompt();
+// While true, the guest's XamInput reads are blanked so the game menu behind
+// the panel doesn't react to the same presses (hooks.cpp).
+extern void set_guest_input_suppressed(bool on);
 
 // Salsbury (the game's cloth-lettering font), loaded in
 // RestuffApp::OnConfigureFonts from assets/fonts/Salsbury Regular/. Baked at
@@ -20,39 +32,81 @@ extern bool consume_difficulty_autoshow();
 inline ImFont* g_salsbury_font = nullptr;
 
 // "Select difficulty" panel styled after the game's stitched-cloth dialogs:
-// pale-blue rounded panel with a dashed stitch border over a dimmed screen.
-// Auto-opens the first time the main menu comes up; F8 reopens it anytime.
-// Mouse click or Up/Down + Enter picks, Esc dismisses. The stitched underline
+// the game's own blue stitched-felt plate (assets/menustuff/blueborder.png,
+// uploaded by RestuffApp) drawn over a dimmed screen; when the texture is
+// missing it falls back to the old procedural pale-blue panel + dash border.
+// Slides in from the top of the screen. Auto-opens when a new save profile is
+// created; F8 reopens it anytime. Controller (D-pad/stick + A, B closes),
+// mouse, or Up/Down + Enter picks; Esc dismisses. The stitched underline
 // marks the difficulty currently in effect.
 class DifficultyDialog : public rex::ui::ImGuiDialog {
 public:
-    explicit DifficultyDialog(rex::ui::ImGuiDrawer* drawer)
-        : rex::ui::ImGuiDialog(drawer) {
+    // panel_tex: ImmediateTexture* cast to ImTextureID (0 = procedural
+    // fallback); panel_uv0/uv1 crop the texture's transparent margins so the
+    // cloth plate fills the panel rect edge to edge. panel_aspect = cropped
+    // plate width/height — the panel keeps that shape and limits how far the
+    // plate is stretched past its native pixels so it stays sharp.
+    explicit DifficultyDialog(rex::ui::ImGuiDrawer* drawer,
+                              ImTextureID panel_tex = ImTextureID{},
+                              ImVec2 panel_uv0 = ImVec2(0.0f, 0.0f),
+                              ImVec2 panel_uv1 = ImVec2(1.0f, 1.0f),
+                              float panel_aspect = 0.0f)
+        : rex::ui::ImGuiDialog(drawer),
+          panel_tex_(panel_tex),
+          panel_uv0_(panel_uv0),
+          panel_uv1_(panel_uv1),
+          panel_aspect_(panel_aspect) {
         rex::ui::RegisterBind("bind_difficulty", "F8", "Select difficulty", [this] {
-            visible_ = !visible_;
-            if (visible_) sel_ = get_difficulty();
+            if (visible_)                                   ClosePanel();
+            else if (!get_difficulty_feature_enabled())     {}
+            else if (get_difficulty_native_prompt())        request_native_difficulty_prompt();
+            else                                            OpenPanel();
         });
     }
 
-    ~DifficultyDialog() { rex::ui::UnregisterBind("bind_difficulty"); }
+    ~DifficultyDialog() {
+        rex::ui::UnregisterBind("bind_difficulty");
+        if (visible_) set_guest_input_suppressed(false);
+    }
 
-    void OnDraw(ImGuiIO& /*io*/) override {
+    void OnDraw(ImGuiIO& io) override {
         if (consume_difficulty_autoshow() && !visible_) {
-            visible_ = true;
-            sel_ = get_difficulty();
+            if (get_difficulty_native_prompt()) request_native_difficulty_prompt();
+            else                                OpenPanel();
         }
         if (!visible_) return;
+
+        // Slide-in: ease-out cubic from above the screen to center.
+        anim_ = Clamp(anim_ + io.DeltaTime / kSlideSeconds, 0.0f, 1.0f);
+        const float ease = 1.0f - (1.0f - anim_) * (1.0f - anim_) * (1.0f - anim_);
 
         ImGuiViewport* vp = ImGui::GetMainViewport();
         const ImVec2 vpos = vp->Pos, vsz = vp->Size;
 
-        // Dim the game behind the panel (like the mock's darkened menu).
+        // Dim the game behind the panel (fades in with the slide).
         ImGui::GetBackgroundDrawList()->AddRectFilled(
-            vpos, ImVec2(vpos.x + vsz.x, vpos.y + vsz.y), IM_COL32(0, 0, 0, 120));
+            vpos, ImVec2(vpos.x + vsz.x, vpos.y + vsz.y),
+            IM_COL32(0, 0, 0, static_cast<int>(120 * ease)));
 
-        const float pw = Clamp(vsz.x * 0.62f, 460.0f, 920.0f);
-        const float ph = Clamp(vsz.y * 0.62f, 320.0f, 560.0f);
-        ImGui::SetNextWindowPos(ImVec2(vpos.x + vsz.x * 0.5f, vpos.y + vsz.y * 0.5f),
+        // With the plate texture, keep its native shape and don't blow it up
+        // much past its source pixels (512-class art goes soft when doubled).
+        float pw, ph;
+        if (panel_tex_ && panel_aspect_ > 0.0f) {
+            ph = Clamp(vsz.y * 0.62f, 300.0f, 500.0f);
+            pw = ph * panel_aspect_;
+            const float max_w = vsz.x * 0.55f;
+            if (pw > max_w) {
+                pw = max_w;
+                ph = pw / panel_aspect_;
+            }
+        } else {
+            pw = Clamp(vsz.x * 0.62f, 460.0f, 920.0f);
+            ph = Clamp(vsz.y * 0.62f, 320.0f, 560.0f);
+        }
+        const float cy_end   = vpos.y + vsz.y * 0.5f;          // settled: centered
+        const float cy_start = vpos.y - ph * 0.5f - 12.0f;     // fully off-screen top
+        const float cy = cy_start + (cy_end - cy_start) * ease;
+        ImGui::SetNextWindowPos(ImVec2(vpos.x + vsz.x * 0.5f, cy),
                                 ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(pw, ph), ImGuiCond_Always);
 
@@ -66,24 +120,60 @@ public:
             return;
         }
 
-        // Keyboard first so the highlight matches this frame's draw.
-        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))   sel_ = (sel_ + 3) % 4;
-        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) sel_ = (sel_ + 1) % 4;
+        // Keyboard + controller first so the highlight matches this frame's draw.
+        using namespace rex::input;
+        const uint16_t pad = PollPadButtons();
+        const uint16_t pressed = static_cast<uint16_t>(pad & ~pad_prev_);
+        pad_prev_ = pad;
+
+        bool nav_up   = ImGui::IsKeyPressed(ImGuiKey_UpArrow) ||
+                        (pressed & X_INPUT_GAMEPAD_DPAD_UP);
+        bool nav_down = ImGui::IsKeyPressed(ImGuiKey_DownArrow) ||
+                        (pressed & X_INPUT_GAMEPAD_DPAD_DOWN);
+        // Hold-to-repeat, like the game's own menus.
+        if (pad & (X_INPUT_GAMEPAD_DPAD_UP | X_INPUT_GAMEPAD_DPAD_DOWN)) {
+            hold_ += io.DeltaTime;
+            if (hold_ > 0.45f) {
+                repeat_ += io.DeltaTime;
+                if (repeat_ > 0.13f) {
+                    repeat_ = 0.0f;
+                    if (pad & X_INPUT_GAMEPAD_DPAD_UP)   nav_up = true;
+                    if (pad & X_INPUT_GAMEPAD_DPAD_DOWN) nav_down = true;
+                }
+            }
+        } else {
+            hold_ = repeat_ = 0.0f;
+        }
+        if (nav_up)   sel_ = (sel_ + 3) % 4;
+        if (nav_down) sel_ = (sel_ + 1) % 4;
+
         const bool confirm = ImGui::IsKeyPressed(ImGuiKey_Enter) ||
                              ImGui::IsKeyPressed(ImGuiKey_KeypadEnter) ||
-                             ImGui::IsKeyPressed(ImGuiKey_Space);
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) visible_ = false;
+                             ImGui::IsKeyPressed(ImGuiKey_Space) ||
+                             (pressed & (X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_START));
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape) ||
+            (pressed & X_INPUT_GAMEPAD_B)) {
+            ClosePanel();
+            ImGui::End();
+            return;
+        }
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 mn = ImGui::GetWindowPos();
         const ImVec2 mx = ImVec2(mn.x + pw, mn.y + ph);
         const float rounding = 30.0f;
 
-        // Cloth panel + stitch border.
-        dl->AddRectFilled(mn, mx, kPanelBg, rounding);
-        dl->AddRect(mn, mx, kPanelEdge, rounding, 0, 3.0f);
-        StitchRoundedRect(dl, ImVec2(mn.x + 9, mn.y + 9), ImVec2(mx.x - 9, mx.y - 9),
-                          rounding - 8.0f, kStitch, 3.0f, 11.0f, 8.0f);
+        // Cloth panel: the game's stitched felt plate when available, else the
+        // procedural rounded rect + dash border it used to draw.
+        if (panel_tex_) {
+            dl->AddImage(panel_tex_, mn, mx, panel_uv0_, panel_uv1_);
+        } else {
+            dl->AddRectFilled(mn, mx, kPanelBg, rounding);
+            dl->AddRect(mn, mx, kPanelEdge, rounding, 0, 3.0f);
+            StitchRoundedRect(dl, ImVec2(mn.x + 9, mn.y + 9),
+                              ImVec2(mx.x - 9, mx.y - 9), rounding - 8.0f,
+                              kStitch, 3.0f, 11.0f, 8.0f);
+        }
 
         ImFont* font = g_salsbury_font ? g_salsbury_font : ImGui::GetFont();
         const float title_px = Clamp(ph * 0.115f, 24.0f, 44.0f);
@@ -105,23 +195,22 @@ public:
         for (int i = 0; i < 4; ++i) {
             const char* t = get_difficulty_name(i);
             const ImVec2 ts = font->CalcTextSizeA(opt_px, FLT_MAX, 0.0f, t);
-            const float cy = area_top + row_step * (i + 0.5f);
-            const ImVec2 p(mn.x + (pw - ts.x) * 0.5f, cy - ts.y * 0.5f);
+            const float cyy = area_top + row_step * (i + 0.5f);
+            const ImVec2 p(mn.x + (pw - ts.x) * 0.5f, cyy - ts.y * 0.5f);
 
             // Hover/click hitbox spanning most of the row.
-            ImGui::SetCursorScreenPos(ImVec2(mn.x + pw * 0.25f, cy - row_step * 0.45f));
+            ImGui::SetCursorScreenPos(ImVec2(mn.x + pw * 0.25f, cyy - row_step * 0.45f));
             ImGui::PushID(i);
             const bool clicked =
                 ImGui::InvisibleButton("opt", ImVec2(pw * 0.5f, row_step * 0.9f));
             if (ImGui::IsItemHovered()) sel_ = i;
             ImGui::PopID();
 
+            // Selection = white text (dark shadow keeps it readable on the
+            // pale cloth); everything else stays the stitched blue.
             const bool hot = (sel_ == i);
-            if (hot)
-                dl->AddRectFilled(ImVec2(p.x - 24, p.y - 6),
-                                  ImVec2(p.x + ts.x + 24, p.y + ts.y + 6),
-                                  kHotBg, 12.0f);
-            dl->AddText(font, opt_px, ImVec2(p.x + 2, p.y + 2), kTextShadow, t);
+            dl->AddText(font, opt_px, ImVec2(p.x + 2, p.y + 2),
+                        hot ? kTextHotShadow : kTextShadow, t);
             dl->AddText(font, opt_px, p, hot ? kTextHot : kText, t);
 
             // Stitched underline marks the difficulty currently in effect.
@@ -132,37 +221,68 @@ public:
 
             if (clicked || (hot && confirm)) {
                 set_difficulty(i);
-                visible_ = false;
+                ClosePanel();
             }
-        }
-
-        // Footer hint (Salsbury too; slightly larger than the old default-font
-        // hint so the display face stays legible at footer size).
-        {
-            const char* t = "Enter / click to select   -   Esc to close   -   F8 reopens";
-            const float px = Clamp(ph * 0.048f, 15.0f, 20.0f);
-            const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0.0f, t);
-            dl->AddText(font, px,
-                        ImVec2(mn.x + (pw - ts.x) * 0.5f, mx.y - ph * 0.075f),
-                        kTextFaint, t);
         }
 
         ImGui::End();
     }
 
 private:
-    bool visible_ = false;
-    int  sel_ = 1;
+    static constexpr float kSlideSeconds = 0.65f;
+
+    bool     visible_ = false;
+    int      sel_ = 1;
+    float    anim_ = 0.0f;      // slide-in progress 0..1
+    uint16_t pad_prev_ = 0;     // last frame's pad buttons (edge detection)
+    float    hold_ = 0.0f;      // dpad hold time (auto-repeat)
+    float    repeat_ = 0.0f;
+    ImTextureID panel_tex_{};   // blueborder.png upload (0 = draw procedural)
+    ImVec2   panel_uv0_{0.0f, 0.0f};
+    ImVec2   panel_uv1_{1.0f, 1.0f};
+    float    panel_aspect_ = 0.0f;  // cropped plate w/h (0 = no texture)
+
+    void OpenPanel() {
+        visible_ = true;
+        sel_ = get_difficulty();
+        anim_ = 0.0f;
+        hold_ = repeat_ = 0.0f;
+        // Seed edge detection with the buttons currently held so the press
+        // that opened the menu (e.g. A on "create saved game") can't also
+        // instantly select an option.
+        pad_prev_ = PollPadButtons();
+        set_guest_input_suppressed(true);
+    }
+
+    void ClosePanel() {
+        visible_ = false;
+        set_guest_input_suppressed(false);
+    }
+
+    // Pad 0 buttons with the left stick folded into the D-pad bits, read from
+    // the SDK input system (host side, unaffected by the guest suppression).
+    static uint16_t PollPadButtons() {
+        auto* rt = rex::Runtime::instance();
+        if (!rt) return 0;
+        auto* is = static_cast<rex::input::InputSystem*>(rt->input_system());
+        if (!is) return 0;
+        rex::input::X_INPUT_STATE st{};
+        if (is->GetState(0, &st) != 0) return 0;
+        uint16_t b = st.gamepad.buttons;
+        const int16_t ly = st.gamepad.thumb_ly;
+        if (ly >  16000) b |= rex::input::X_INPUT_GAMEPAD_DPAD_UP;
+        if (ly < -16000) b |= rex::input::X_INPUT_GAMEPAD_DPAD_DOWN;
+        return b;
+    }
 
     // Palette sampled from the game's stitched dialog look.
     static constexpr ImU32 kPanelBg    = IM_COL32(213, 237, 244, 252);
     static constexpr ImU32 kPanelEdge  = IM_COL32(74, 163, 199, 255);
     static constexpr ImU32 kStitch     = IM_COL32(58, 145, 185, 220);
-    static constexpr ImU32 kText       = IM_COL32(23, 111, 156, 255);
-    static constexpr ImU32 kTextHot    = IM_COL32(6, 76, 116, 255);
-    static constexpr ImU32 kTextFaint  = IM_COL32(23, 111, 156, 140);
-    static constexpr ImU32 kTextShadow = IM_COL32(255, 255, 255, 110);
-    static constexpr ImU32 kHotBg      = IM_COL32(255, 255, 255, 90);
+    static constexpr ImU32 kText          = IM_COL32(23, 111, 156, 255);
+    static constexpr ImU32 kTextHot       = IM_COL32(255, 255, 255, 255);
+    static constexpr ImU32 kTextShadow    = IM_COL32(255, 255, 255, 110);
+    static constexpr ImU32 kTextHotShadow = IM_COL32(6, 76, 116, 170);
 
     static float Clamp(float v, float lo, float hi) {
         return v < lo ? lo : (v > hi ? hi : v);

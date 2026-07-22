@@ -37,6 +37,13 @@ endif()
 # its own renderer, so the plugin is required.
 rexglue_setup_target(restuff GPU_PLUGINS xenos)
 
+# Media Foundation (MP4/H.264 decode) + XAudio2 (the video's audio track) for
+# the fullscreen video overlay (src/video_player.h). Both ship with Windows, so
+# no thirdparty dependency.
+if(WIN32)
+    target_link_libraries(restuff PRIVATE mfplat mfreadwrite mfuuid xaudio2)
+endif()
+
 # Stage a default runtime config (windowed mode + gpu_plugin=xenos) next to the
 # executable. Copied only when absent so user edits survive rebuilds; delete the
 # staged copy to regenerate it from this template.
