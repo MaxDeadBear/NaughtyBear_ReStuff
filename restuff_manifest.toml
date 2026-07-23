@@ -10,8 +10,8 @@
 # (or build the `restuff_codegen` CMake target).
 
 [project]
+sdk_version = "0.8.0"
 name = "restuff"
-sdk_version = "0.8.1"
 game_root = "assets"
 
 [entrypoint]
@@ -23,6 +23,8 @@ setjmp_address  = 0x83096C10
 longjmp_address = 0x830968F0
 
 [entrypoint.functions]
+0x82B3C340 = {}  # ctx.ctr.u32[0]
+0x827CA1D0 = {}
 0x827B9630 = {}  # ctx.ctr.u32[0]
 0x827788D0 = {}  # ctx.ctr.u32[0]
 0x827B9610 = {}  # ctx.ctr.u32[0]
@@ -98,6 +100,27 @@ name = "on_get_unlockable"
 registers = ["r3"]
 after_instruction = false
 
+# DamageableComponent apply method (vtbl+0x64, sub_8284CE68) entry: r3 = the
+# component, r4 = DamageData (float amount at +16; positive = damage, negative
+# = heal). The difficulty feature rescales the amount in place before the game
+# uses it (see on_apply_damage).
+[[entrypoint.midasm_hook]]
+address = 0x8284CE68
+name = "on_apply_damage"
+registers = ["r3", "r4"]
+after_instruction = false
+
+# Native StartEscapeTimer (sub_8270AE88, behind the Lua-exposed
+# HudComponent::StartEscapeTimer): f1 = duration seconds, r4 = eEscapeType.
+# LOG-ONLY (difficulty_debug): the HUD countdown is display-only; difficulty
+# scales the payphone duration at the source instead (patch_payphone_duration
+# in on_lua_load), which feeds both the real script timer and this HUD call.
+[[entrypoint.midasm_hook]]
+address = 0x8270AE88
+name = "on_escape_timer"
+registers = ["f1", "r4"]
+after_instruction = false
+
 [[entrypoint.midasm_hook]]
 address = 0x82f47dd4
 name = "on_ctx_reg_header"
@@ -120,4 +143,136 @@ after_instruction = false
 address = 0x82f47778
 name = "on_ctx_reg_data"
 registers = ["r10"]
+after_instruction = false
+
+# SetBackgroundColor GAS tag Execute (sub_82CD17B0) entry. r3 = the 8-byte tag
+# object; bytes +5/+6/+7 are R/G/B. Lets on_set_bg_color rewrite the title's
+# yellow background color to blue (the main menu already uses blue).
+[[entrypoint.midasm_hook]]
+address = 0x82CD17B0
+name = "on_set_bg_color"
+registers = ["r3"]
+after_instruction = false
+
+# Char-id store in the PlaceObject2/3 parser (stw r5,0x50(r29)). r29 = the record,
+# r31 = the parser stream (identifies the movie being parsed); fires for every
+# placement. on_gfx_place buffers/recolors the felt sky records, scoped to the
+# startmenu movie via the sky_trigger_cid confirmation.
+[[entrypoint.midasm_hook]]
+address = 0x82CD682C
+name = "on_gfx_place"
+registers = ["r29", "r31"]
+after_instruction = true
+
+# After the SWF PlaceObject2/3 cxform read (bl sub_82D273F8). r29 = the record,
+# r31 = the parser stream. Re-applies the sky override after a supplied cxform
+# overwrites the record's cxform field.
+[[entrypoint.midasm_hook]]
+address = 0x82CD6868
+name = "on_gfx_cxform"
+registers = ["r29", "r31"]
+after_instruction = true
+
+# GFxPlaceObject2::Execute entry (sub_82CD1538). r3 = the tag. LOG-ONLY (see
+# on_gfx_execute) -- diagnosis of which sky tags replay at runtime.
+[[entrypoint.midasm_hook]]
+address = 0x82CD1538
+name = "on_gfx_execute"
+registers = ["r3"]
+after_instruction = false
+
+# GASColor::setRGB tail (sub_82C88130), after the 8-float cxform write into the
+# character (+44), before the dirty-notify bctrl. r30 = the character. Catches
+# runtime AS re-tints of the sky (the menu->Back yellow flash).
+[[entrypoint.midasm_hook]]
+address = 0x82C88274
+name = "on_as_setrgb"
+registers = ["r30"]
+after_instruction = false
+
+# GASColor::setTransform tail (sub_82C87B38), same contract; r26 = the character.
+[[entrypoint.midasm_hook]]
+address = 0x82C87DF4
+name = "on_as_settransform"
+registers = ["r26"]
+after_instruction = false
+
+# --- Native score row in the objective panel ---------------------------------
+# The in-level objective panel is a set of GFx invokes on the NBPlayerHud movie
+# (singleton at 0x8332F5E0): ClearObjectiveBox / AddObjective / SetObjectiveText
+# / SetObjectiveState. The campaign refresh (sub_8271A038, run per tick from
+# ObjectiveMonitorManager::Update) rebuilds rows as Clear + AddObjective per
+# revealed objective, then updates rows positionally (always idx < game rows).
+# We bookkeep the box through the wrapper entries and append our own score row
+# after each rebuild (see update_score_objective in hooks.cpp).
+
+# hazingHud ClearObjectiveBox invoke wrapper entry. The box was emptied: any
+# appended score row is gone; reset the row bookkeeping.
+[[entrypoint.midasm_hook]]
+address = 0x82706150
+name = "on_objbox_clear"
+registers = []
+after_instruction = false
+
+# hazingHud AddObjective invoke wrapper entry. r3 = hud manager, r4 = row text.
+# Counts game-added rows (our own appends are flagged and skipped); if a game
+# row would ever land after our score row, the hook swaps the two so ours stays
+# last and the game's positional indices stay coherent.
+[[entrypoint.midasm_hook]]
+address = 0x827060B8
+name = "on_objbox_add"
+registers = ["r3", "r4"]
+after_instruction = false
+
+# ObjectiveMonitorManager campaign refresh (sub_8271A038) entry: marks the
+# rebuild in flight so on_swap won't touch the box mid-refresh. r3 = the
+# manager; captured so toggling the score row off can set the rows-dirty byte
+# (mgr+28) and have the game itself rebuild the box without our row (the box
+# has no per-row remove -- rows only vanish via Clear + rebuild).
+[[entrypoint.midasm_hook]]
+address = 0x8271A038
+name = "on_obj_refresh_begin"
+registers = ["r3"]
+after_instruction = false
+
+# Campaign refresh common tail (stb r23,0x1C(r22) -- the dirty flags being
+# cleared; every exit passes through here). The box is fully rebuilt at this
+# point, so this is the one safe, race-free spot to (re)append the score row.
+[[entrypoint.midasm_hook]]
+address = 0x8271A588
+name = "on_obj_refresh_end"
+registers = []
+after_instruction = true
+
+# hazingHud SetPIPString invoke wrapper entry (the native bear-action banner
+# text, e.g. "CUDDLES IS OOFING HIMSELF"). r3 = hud manager, r4 = the final
+# banner cstring. on_pip_string rewrites pronoun words per the
+# bearcam_pronouns map (redirecting r4 to a scratch copy) so the pronoun
+# override applies to the NATIVE cutaway too, not just the mode-2 card.
+[[entrypoint.midasm_hook]]
+address = 0x827068D0
+name = "on_pip_string"
+registers = ["r3", "r4"]
+after_instruction = false
+
+# hazingHud SetPIPNPCName invoke wrapper entry. r4 = the PIP window's NPC
+# display name ("CUDDLES"). Captured as the pronoun-match fallback for banner
+# lines that don't repeat the bear's name.
+[[entrypoint.midasm_hook]]
+address = 0x82706A60
+name = "on_pip_npcname"
+registers = ["r4"]
+after_instruction = false
+
+# hg::Camera per-frame update entry (sub_82B07720, found by tracing
+# UpdateViewMatrix's non-SWIG callers). r4 = the pointer to the new camera
+# matrix the follow system computed this frame, about to be pushed via
+# UpdateViewMatrix (called internally, later in this same function).
+# on_camera_update substitutes r4 with the free camera's own matrix while
+# active, leaving everything else in the function (dirty flag, current-
+# camera bookkeeping, frustum-related calls) completely unmodified.
+[[entrypoint.midasm_hook]]
+address = 0x82B07720
+name = "on_camera_update"
+registers = ["r4"]
 after_instruction = false

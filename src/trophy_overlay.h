@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <rex/ui/imgui_dialog.h>
@@ -10,15 +11,36 @@ extern int get_level_score();
 // Per-tier medal score target (tier 0=Bronze..3=Platinum), auto-resolved from
 // the game's GradeScore; 0 = unknown.
 extern int get_trophy_target(int tier);
+// Native score row in the in-level objective list (score_objective cvar).
+extern bool get_score_objective();
+extern void set_score_objective(bool v);
 
 // A compact, draggable on-screen counter (FPS-style shadowed text) showing how
 // many points remain to each trophy tier. Drag it anywhere with the mouse.
+//
+// F10 single tap toggles this ImGui counter; a DOUBLE tap (within 350ms)
+// instead toggles the native score row in the game's objective list (the
+// second tap reverts the counter toggle the first tap performed, so the two
+// displays switch independently).
 class TrophyOverlayDialog : public rex::ui::ImGuiDialog {
 public:
     explicit TrophyOverlayDialog(rex::ui::ImGuiDrawer* drawer)
         : rex::ui::ImGuiDialog(drawer) {
-        rex::ui::RegisterBind("bind_trophy_overlay", "F10", "Toggle trophy counter",
-                              [this] { visible_ = !visible_; });
+        rex::ui::RegisterBind("bind_trophy_overlay", "F10",
+                              "Toggle trophy counter (double-tap: objective row)",
+                              [this] {
+            using clock = std::chrono::steady_clock;
+            const auto now = clock::now();
+            const bool double_tap =
+                (now - last_f10_) < std::chrono::milliseconds(350);
+            last_f10_ = now;
+            if (double_tap) {
+                visible_ = !visible_;  // undo the first tap's counter toggle
+                set_score_objective(!get_score_objective());
+            } else {
+                visible_ = !visible_;
+            }
+        });
         rex::ui::RegisterBind("bind_trophy_mode", "F9", "Cycle trophy counter mode",
                               [this] { mode_ = (mode_ + 1) % 2; });
     }
@@ -97,6 +119,7 @@ public:
 private:
     bool visible_ = false;
     int mode_ = 0;  // 0 = points remaining (countdown), 1 = absolute targets
+    std::chrono::steady_clock::time_point last_f10_{};  // F10 double-tap timer
 
     static void Commafmt(int v, char* out) {
         char tmp[24];
