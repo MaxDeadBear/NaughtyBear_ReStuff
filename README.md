@@ -1,3 +1,7 @@
+<img width="1024" height="512" alt="logo" src="https://github.com/user-attachments/assets/2bf3f451-05f7-40a8-80ce-93ad4740b90a" />
+
+
+
 What is ReStuff?
 ---------------------------------------------
 Restuff is a recompilation of the xbox 360 title Naughty Bear Gold Edition made with the rexglue-SDK
@@ -23,3 +27,12 @@ aside from having access to all of the code in the game it also has improvements
   How to build 
   -----------------------------------------
   1. follow https://github.com/rexglue/rexglue-sdk/wiki but replace the main sdk with https://github.com/SolarRecomps/rexglue-ostentation/tree/dev
+
+
+
+Credits
+----------------------------
+- AngusTMH for the restuff logo
+- Tom for the original Rexglue-SDK https://github.com/rexglue/rexglue-sdk
+- SolarCookies for the Rexglue-sdk fork that allows texture and audio replacement amongst other things https://github.com/SolarRecomps/rexglue-ostentation/tree/dev
+- MadLadMikael for cleaning up and assisting with code
