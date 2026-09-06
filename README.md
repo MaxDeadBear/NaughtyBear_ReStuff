@@ -10,8 +10,11 @@ What makes it different than playing on xenia?
 ------------------------------------------------------
 aside from having access to all of the code in the game it also has improvements like 
 - 60fps
-- a randomizer
-- texture/audio replacements with the rexglue-SDK fork https://github.com/SolarRecomps/rexglue-ostentation/tree/dev
+
+- unlock all cheat (optional)
+
+- native renderer
+
 - and many more!
 
 
@@ -26,7 +29,7 @@ aside from having access to all of the code in the game it also has improvements
  
   How to build 
   -----------------------------------------
-  1. follow https://github.com/rexglue/rexglue-sdk/wiki but replace the main sdk with https://github.com/SolarRecomps/rexglue-ostentation/tree/dev
+  1. follow https://github.com/rexglue/rexglue-sdk/wiki
 
 
 
@@ -34,5 +37,4 @@ Credits
 ----------------------------
 - AngusTMH for the restuff logo
 - Tom for the original Rexglue-SDK https://github.com/rexglue/rexglue-sdk
-- SolarCookies for the Rexglue-sdk fork that allows texture and audio replacement amongst other things https://github.com/SolarRecomps/rexglue-ostentation/tree/dev
 - MadLadMikael for cleaning up and assisting with code
