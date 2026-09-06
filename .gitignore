@@ -1,0 +1,22 @@
+out/
+assets/
+lua_dump/
+logs/
+*.log
+# NOTE: do NOT ignore the source-root restuff.toml -- CMakeLists stages it
+# as the default runtime config. Build-dir copies are covered by out/.
+/pipeline_prewarm*.bin
+/pipeline_cache.bin*
+/shader_spv.bin
+
+# Machine-local build paths; copy CMakeUserPresets.json.example instead.
+CMakeUserPresets.json
+
+# Codegen output: recompiled from YOUR OWN Default.xex at build time.
+# Never commit it -- it is derived from the game binary, and it is 455
+# files. (generated/gitignore.txt is misnamed and so does nothing.)
+/generated/*
+!/generated/gitignore.txt
+# rexglue.cmake is SDK boilerplate but carries our local M4.28 patch and
+# defines rexglue_setup_target -- configure fails without it.
+!/generated/rexglue.cmake

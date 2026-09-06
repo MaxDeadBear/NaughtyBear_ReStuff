@@ -1,0 +1,40 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "local-win-base",
+            "hidden": true,
+            "description": "Machine-local paths. Copy this file to CMakeUserPresets.json (which is gitignored) and edit the four paths below. CMakeLists.txt defaults REXSDK_SOURCE_TREE and RESTUFF_VULKAN_INCLUDE to the original author's Linux paths, so they must be overridden. CMAKE_RC_COMPILER is set because enable_language(RC) otherwise wants an rc.exe that is only on PATH inside a VS Developer Shell. RESTUFF_RECOMP_FMA and REXGLUE_CODEGEN_ENV are a MATCHED PAIR: setting only the compile flag silently regenerates unfused code while the flag stays on -- the tell is the codegen summary reading '0 written, 455 unchanged'.",
+            "cacheVariables": {
+                "CMAKE_PREFIX_PATH": "C:/path/to/rexglue-sdk/out/install/win-amd64",
+                "REXSDK_VERSION": "0.10.0",
+                "REXSDK_SOURCE_TREE": "C:/path/to/rexglue-sdk",
+                "RESTUFF_VULKAN_INCLUDE": "C:/VulkanSDK/1.4.357.0/Include",
+                "CMAKE_RC_COMPILER": "llvm-rc",
+                "RESTUFF_RECOMP_FMA": "ON",
+                "REXGLUE_CODEGEN_ENV": "REX_EMIT_FMA=1"
+            }
+        },
+        {
+            "name": "local-relwithdebinfo",
+            "displayName": "Local Windows AMD64 RelWithDebInfo",
+            "inherits": ["local-win-base", "win-amd64-relwithdebinfo"]
+        },
+        {
+            "name": "local-release",
+            "displayName": "Local Windows AMD64 Release",
+            "inherits": ["local-win-base", "win-amd64-release"]
+        },
+        {
+            "name": "local-debug",
+            "displayName": "Local Windows AMD64 Debug",
+            "inherits": ["local-win-base", "win-amd64-debug"]
+        }
+    ],
+    "buildPresets": [
+        { "name": "local-relwithdebinfo", "configurePreset": "local-relwithdebinfo" },
+        { "name": "local-release", "configurePreset": "local-release" },
+        { "name": "local-debug", "configurePreset": "local-debug" }
+    ]
+}

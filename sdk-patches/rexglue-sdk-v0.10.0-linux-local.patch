@@ -1,0 +1,142 @@
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index 0ede542..a218277 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -24,6 +24,8 @@
+ #include <simde/x86/avx.h>
+ #include <simde/x86/sse.h>
+ #include <simde/x86/sse4.1.h>
++// LOCAL PATCH: fused vmaddfp/vnmsubfp (REX_EMIT_FMA codegen) needs fmadd.
++#include <simde/x86/fma.h>
+ 
+ //=============================================================================
+ // Pack/Unpack Constants (NORMPACKED32 - 2:10:10:10 format)
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 947817f..9921b1e 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -110,6 +110,9 @@ class VulkanDevice {
+     bool shaderCullDistance = false;
+     bool sparseBinding = false;
+     bool sparseResidencyBuffer = false;
++    // LOCAL PATCH (M4.3): BC/DXT sampled-texture support for the native
++    // renderer's zero-decode upload path.
++    bool textureCompressionBC = false;
+ 
+     // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)
+ 
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index aa55a4a..aa53948 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -32,6 +32,8 @@ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilCompareMask)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilReference)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetStencilWriteMask)
+ XE_UI_VULKAN_FUNCTION(vkCmdSetViewport)
++// LOCAL PATCH (M4.33 GPUPASS diag): timestamp query entry points.
++XE_UI_VULKAN_FUNCTION(vkCmdWriteTimestamp)
+ XE_UI_VULKAN_FUNCTION(vkCreateBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCreateBufferView)
+ XE_UI_VULKAN_FUNCTION(vkCreateCommandPool)
+@@ -71,6 +73,7 @@ XE_UI_VULKAN_FUNCTION(vkFreeMemory)
+ XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+ XE_UI_VULKAN_FUNCTION(vkGetFenceStatus)
++XE_UI_VULKAN_FUNCTION(vkGetQueryPoolResults)  // LOCAL PATCH (M4.33)
+ XE_UI_VULKAN_FUNCTION(vkGetImageMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkInvalidateMappedMemoryRanges)
+ XE_UI_VULKAN_FUNCTION(vkMapMemory)
+diff --git a/resources/templates/init/rexglue_cmake.inja b/resources/templates/init/rexglue_cmake.inja
+index f39557b..37b72ef 100644
+--- a/resources/templates/init/rexglue_cmake.inja
++++ b/resources/templates/init/rexglue_cmake.inja
+@@ -114,10 +114,18 @@ endmacro()
+ # codegen, including one a project assembles itself rather than taking the
+ # library rexglue_setup_target() builds. The stamp comes first: the DEPFILE
+ # names it.
++# LOCAL PATCH (M4.28): the codegen CLI and its emitter env are overridable.
++# Closes two traps: the in-build regen silently used the stock found-package
++# CLI (replacing fused-FMA generated code with unfused emission), and a
++# Linux->Windows cross build imports rex::rexglue as an unrunnable .exe.
++set(REXGLUE_CODEGEN_CLI "$<TARGET_FILE:rex::rexglue>" CACHE STRING
++    "rexglue CLI used for in-build codegen (must be host-runnable)")
++set(REXGLUE_CODEGEN_ENV "" CACHE STRING
++    "Codegen-time env assignments (semicolon list, e.g. REX_EMIT_FMA=1)")
+ add_custom_command(
+     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
+            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
+-    COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
++    COMMAND ${CMAKE_COMMAND} -E env ${REXGLUE_CODEGEN_ENV} ${REXGLUE_CODEGEN_CLI} codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
+     DEPFILE "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.d"
+     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
+     COMMENT "Generating recompiled code for {{ names.snake_case }}"
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index cbdd7f7..cd5869d 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -13,6 +13,7 @@
+ #include "helpers.h"
+ 
+ #include <cmath>
++#include <cstdlib>  // LOCAL PATCH: getenv for the REX_EMIT_FMA gate
+ 
+ #include <simde/x86/sse.h>
+ 
+@@ -90,8 +91,28 @@ bool build_vmulfp128(BuilderContext& ctx) {
+   return true;
+ }
+ 
++// LOCAL PATCH (M4.16 parity): codegen-time env REX_EMIT_FMA=1 emits FUSED
++// multiply-add for vmaddfp/vnmsubfp (real VMX fuses: one rounding, not two).
++// The consuming project must compile recompiled TUs with FMA3 available
++// (e.g. -mfma) or simde silently falls back to the unfused pair.
++static bool emit_fused_fma() {
++  static const bool fused = [] {
++    const char* e = std::getenv("REX_EMIT_FMA");
++    return e && e[0] == '1';
++  }();
++  return fused;
++}
++
+ bool build_vmaddfp(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(true);
++  if (emit_fused_fma()) {
++    ctx.println(
++        "\tsimde_mm_store_ps({}.f32, simde_mm_fmadd_ps(simde_mm_load_ps({}.f32), "
++        "simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));",
++        ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
++        ctx.v(ctx.insn.operands[3]));
++    return true;
++  }
+   ctx.println(
+       "\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
+       "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));",
+@@ -103,6 +124,15 @@ bool build_vmaddfp(BuilderContext& ctx) {
+ bool build_vnmsubfp(BuilderContext& ctx) {
+   // vnmsubfp: vD = -(vA * vB - vC) - negation done by XOR with sign bit (0x80000000)
+   ctx.emit_set_flush_mode(true);
++  if (emit_fused_fma()) {
++    // fnmadd(a,b,c) = -(a*b) + c = -(a*b - c): the fused form of the same op.
++    ctx.println(
++        "\tsimde_mm_store_ps({}.f32, simde_mm_fnmadd_ps(simde_mm_load_ps({}.f32), "
++        "simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));",
++        ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
++        ctx.v(ctx.insn.operands[3]));
++    return true;
++  }
+   ctx.println(
+       "\tsimde_mm_store_ps({}.f32, "
+       "simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..6dd9e7e 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -643,6 +643,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     XE_UI_VULKAN_FEATURE(shaderCullDistance)
+     XE_UI_VULKAN_FEATURE(sparseBinding)
+     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
++    // LOCAL PATCH (M4.3): see device.h textureCompressionBC.
++    XE_UI_VULKAN_FEATURE(textureCompressionBC)
+   }
+ 
+   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {

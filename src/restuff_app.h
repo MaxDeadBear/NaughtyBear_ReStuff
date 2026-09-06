@@ -4,26 +4,171 @@
 
 #pragma once
 
-#include <cstdint>
 #include <filesystem>
-#include <memory>
-#include <vector>
+
+#ifdef __linux__
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <sys/time.h>
+#include <ucontext.h>
+#include <xmmintrin.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <thread>
+#endif
 
 #include <rex/filesystem.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
 #include <rex/ui/imgui_drawer.h>
-#include <rex/ui/immediate_drawer.h>
 
 #include "fps_overlay.h"
 #include "cheats_overlay.h"
-#include "difficulty_overlay.h"
+// The difficulty selector was the modding fork's feature and is fully removed
+// from this tree (M3.287 disabled it; the code was excised outright later).
+// difficulty_overlay.h, the scaling hooks, the payphone timer patch and the
+// save-root new-profile watcher are all gone. The fork keeps them; main does not.
 #include "trophy_overlay.h"
-#include "ui_image.h"
 #include "video_overlay.h"
+#include "native_vk.h"
 
-// hooks.cpp: save root for the new-profile watcher (difficulty auto-show).
-extern void set_user_data_root(const std::filesystem::path& p);
+#ifdef __linux__
+// M3.40: FP-exception guard. The SDK's fpscr.enableFlushMode() (emitted by
+// recompiled code whenever the guest sets flush-to-zero) writes its CACHED
+// csr member to MXCSR; that cache only carries the exception-MASK bits if
+// InitHost() ran on the context first. The APC-delivery path
+// (XThread::DeliverAPCs -> FunctionDispatcher::Execute -> guest fn) runs
+// recompiled code on contexts that skip InitHost(), so enableFlushMode there
+// writes MXCSR=0x8040 (FTZ+DAZ only) and UNMASKS all six FP exceptions. The
+// next SSE op on inf/NaN/overflow then raises SIGFPE (observed: repeated
+// crashes in simde_mm_add_ps <- sub_82A39838 via DeliverAPCs). Real Xbox 360
+// code, like ~all game code, runs with FP exceptions masked.
+//
+// Fix the symptom robustly host-side: on a FLOAT SIGFPE, re-set the six
+// exception-mask bits in the fault's SAVED MXCSR (must edit the ucontext, not
+// live MXCSR -- the kernel restores fpregs on sigreturn) and return; the
+// faulting instruction re-executes with exceptions masked and yields the
+// default IEEE result. INTEGER div/overflow SIGFPE is a genuine fault
+// elsewhere -- chain to default so it can't mask-loop. Opt out:
+// RESTUFF_NO_FPE_GUARD=1.
+namespace restuff_fpe_guard {
+inline std::atomic<uint64_t> g_caught{0};
+inline void Handler(int sig, siginfo_t* info, void* ucv) {
+  if (info && (info->si_code == FPE_INTDIV || info->si_code == FPE_INTOVF)) {
+    signal(SIGFPE, SIG_DFL);  // re-raise as a real crash
+    return;
+  }
+  auto* uc = static_cast<ucontext_t*>(ucv);
+  if (uc && uc->uc_mcontext.fpregs) {
+    uc->uc_mcontext.fpregs->mxcsr |= 0x1F80u;  // mask IM/DM/ZM/OM/UM/PM
+  }
+  if (g_caught.fetch_add(1, std::memory_order_relaxed) == 0) {
+    const char msg[] = "[FPE-GUARD] caught+masked a float SIGFPE; continuing\n";
+    ssize_t n = write(2, msg, sizeof(msg) - 1);
+    (void)n;
+  }
+}
+inline void Init() {
+  // M3.42: OPT-IN (was default-on in M3.40). The handler catches a float
+  // SIGFPE, re-masks, and RETRIES the instruction -- but if the SDK's
+  // MXCSR-unmask (enableFlushMode on APC contexts) happens FREQUENTLY (per
+  // skinned/animated draw), the per-exception signal-delivery cost tanks fps
+  // and starves the audio thread (user: laggy, no music/narrator, few sfx,
+  // 3x cutscene load with the guard on). A rare crash is the lesser evil, and
+  // the real fix is to stop the unmask at the source, not catch every trap.
+  // RESTUFF_FPE_GUARD=1 re-enables the catch-and-continue behaviour.
+  if (getenv("RESTUFF_FPE_GUARD")) {
+    struct sigaction sa = {};
+    sa.sa_sigaction = Handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGFPE, &sa, nullptr);
+  }
+  // RESTUFF_FPE_SELFTEST=1: deterministically reproduce the guest's failure
+  // mode (unmask FP exceptions exactly as the buggy enableFlushMode path does,
+  // then do an SSE op that raises FE_INVALID) and confirm the guard converts
+  // the would-be SIGFPE crash into a survivable, masked continuation.
+  if (getenv("RESTUFF_FPE_SELFTEST")) {
+    fprintf(stderr, "[FPE-SELFTEST] unmasking FP exceptions and forcing 0.0/0.0...\n");
+    fflush(stderr);
+    _mm_setcsr(_mm_getcsr() & ~0x1F80u);  // clear all mask bits (as the bug does)
+    volatile float z = 0.0f;
+    volatile float r = z / z;  // 0/0 => FE_INVALID => SIGFPE with masks cleared
+    (void)r;
+    fprintf(stderr, "[FPE-SELFTEST] SURVIVED (guard caught=%llu); result=%f\n",
+            (unsigned long long)g_caught.load(), (double)r);
+    fflush(stderr);
+  }
+}
+}  // namespace restuff_fpe_guard
+
+// RESTUFF_SELFPROF=<path>: in-process CPU sampler (yama blocks external
+// ptrace profilers even with PR_SET_PTRACER_ANY for frame reads). SIGPROF via
+// ITIMER_PROF lands on whichever thread is consuming CPU; the handler records
+// raw leaf PCs, a flusher aggregates and appends "off=<hex> n=<count>" lines
+// (PC minus the main module base) for offline addr2line against ./restuff.
+namespace restuff_selfprof {
+inline std::atomic<uint32_t> g_pos{0};
+inline void* g_pc[65536];
+inline uintptr_t g_base = 0;
+
+inline void Handler(int) {
+  void* frames[4];
+  const int n = backtrace(frames, 4);
+  if (n > 2) g_pc[g_pos.fetch_add(1, std::memory_order_relaxed) % 65536] = frames[2];
+}
+
+inline void Init() {
+  const char* path = getenv("RESTUFF_SELFPROF");
+  if (!path) return;
+  // main module base from /proc/self/maps (first executable mapping of us)
+  if (FILE* f = fopen("/proc/self/maps", "r")) {
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+      if (strstr(line, "/restuff") && strstr(line, " r-xp ")) {
+        g_base = strtoull(line, nullptr, 16);
+        break;
+      }
+    }
+    fclose(f);
+  }
+  struct sigaction sa = {};
+  sa.sa_handler = Handler;
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGPROF, &sa, nullptr);
+  itimerval tv{{0, 4000}, {0, 4000}};  // 250Hz across busy threads
+  setitimer(ITIMER_PROF, &tv, nullptr);
+  std::thread([path] {
+    std::string out = path;
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::seconds(15));
+      std::map<uintptr_t, uint32_t> agg;
+      const uint32_t end = std::min<uint32_t>(g_pos.load(std::memory_order_relaxed), 65536);
+      for (uint32_t i = 0; i < end; ++i)
+        if (g_pc[i]) ++agg[reinterpret_cast<uintptr_t>(g_pc[i])];
+      std::multimap<uint32_t, uintptr_t, std::greater<>> top;
+      for (auto& [pc, n] : agg) top.emplace(n, pc);
+      if (FILE* f = fopen(out.c_str(), "a")) {
+        fprintf(f, "=== selfprof window samples=%u base=%zx\n", end, size_t(g_base));
+        int k = 0;
+        for (auto& [n, pc] : top) {
+          fprintf(f, "off=%zx n=%u\n", size_t(pc - g_base), n);
+          if (++k >= 40) break;
+        }
+        fclose(f);
+      }
+      g_pos.store(0, std::memory_order_relaxed);
+      memset(g_pc, 0, sizeof g_pc);
+    }
+  }).detach();
+}
+}  // namespace restuff_selfprof
+#endif
 
 class RestuffApp : public rex::ReXApp {
  public:
@@ -35,84 +180,58 @@ class RestuffApp : public rex::ReXApp {
         PPCImageConfig));
   }
 
-  // The new SDK extracted Xenos GPU emulation into a runtime-loaded plugin
-  // (rexgpu-xenos). This project renders through that emulated GPU rather than
-  // its own renderer, so the plugin must be loaded. config.gpu_plugin is
-  // pre-populated from the `gpu_plugin` cvar (CLI / restuff.toml), so only
-  // default it here when nothing set it -- the recomp then renders even with no
-  // config file present. CMake stages rexgpu-xenos next to the exe (see
-  // GPU_PLUGINS xenos in CMakeLists.txt).
+  // Rendering backend selection. With use_native_renderer (default true), inject
+  // our own native Vulkan graphics system (NativeVulkanGraphicsSystem) and clear
+  // gpu_plugin -- config.graphics wins because the xenos plugin is only loaded
+  // when config.graphics is empty. Set use_native_renderer=false in restuff.toml
+  // to fall back to the stock xenos GPU emulation plugin (staged next to the exe
+  // via GPU_PLUGINS xenos in CMakeLists.txt).
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    if (config.gpu_plugin.empty()) {
+#ifdef __linux__
+    // Allow any same-user process to ptrace us (yama scope-1 otherwise limits
+    // attach to ancestors) -- lets the drive harness sample stacks with
+    // eu-stack/gdb for guest-hot-function profiling. Debug tooling only.
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+    restuff_fpe_guard::Init();
+    restuff_selfprof::Init();
+#endif
+    if (REXCVAR_GET(use_native_renderer)) {
+      config.gpu_plugin.clear();
+      config.graphics = std::make_unique<restuff::NativeVulkanGraphicsSystem>();
+    } else if (config.gpu_plugin.empty()) {
       config.gpu_plugin = "xenos";
     }
   }
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
-    // Difficulty panel background: the game's blue stitched-felt plate.
-    // Upload once; the dialog gets the ImTextureID plus UVs cropped to the
-    // plate's alpha bounds (the PNG has transparent margins). Any failure
-    // (file missing, decode error, no immediate drawer) leaves the id 0 and
-    // the panel draws its old procedural background instead.
-    ImTextureID panel_id{};
-    ImVec2 panel_uv0(0.0f, 0.0f), panel_uv1(1.0f, 1.0f);
-    float panel_aspect = 0.0f;
-    if (auto* imm = immediate_drawer()) {
-      const std::filesystem::path png = FindAssetFile(
-          std::filesystem::path("menustuff") / "blueborder.png");
-      std::vector<uint8_t> rgba;
-      uint32_t w = 0, h = 0;
-      if (!png.empty() && restuff::LoadImageRGBA(png, rgba, w, h)) {
-        panel_bg_tex_ = imm->CreateTexture(
-            w, h, rex::ui::ImmediateTextureFilter::kLinear, false, rgba.data());
-        if (panel_bg_tex_) {
-          restuff::AlphaBoundsUV(rgba, w, h, panel_uv0, panel_uv1);
-          panel_id = reinterpret_cast<ImTextureID>(panel_bg_tex_.get());
-          panel_aspect = ((panel_uv1.x - panel_uv0.x) * w) /
-                         ((panel_uv1.y - panel_uv0.y) * h);
-        }
-      }
+    // M3.146 (RESTUFF_NO_OVERLAYS=1): adding ANY dialog registers the ImGui
+    // drawer as a UI drawer (imgui_drawer.cpp:65-72), and the presenter then
+    // chooses kUIThreadOnRequest over kGuestOutputThreadImmediately purely
+    // because ui_drawers_ is non-empty (presenter.cpp:1327). That puts
+    // vkQueuePresentKHR on the UI THREAD, which holds the SDK's single queue
+    // mutex across a blocking X write -- while our present thread starves in
+    // AcquireQueue and the swapchain keeps showing the bare clear. That is the
+    // captured mechanism behind the blue/black launch failures. This gate
+    // exists to A/B it: with no dialogs the drawer never registers and the
+    // guest-output thread presents directly.
+    if (getenv("RESTUFF_NO_OVERLAYS")) {
+      return;
     }
-
-    drawer->AddDialog(new FpsOverlayDialog(drawer));
-    drawer->AddDialog(new CheatsDialog(drawer));
-    drawer->AddDialog(new DifficultyDialog(drawer, panel_id, panel_uv0,
-                                           panel_uv1, panel_aspect));
-    drawer->AddDialog(new TrophyOverlayDialog(drawer));
-    // Fullscreen video overlay (attract-mode cinematic). Idle until something
-    // calls restuff::PlayVideo(); needs the immediate drawer to upload frames.
-    drawer->AddDialog(new VideoOverlayDialog(drawer, immediate_drawer()));
+    // NOTE: do NOT call drawer->AddDialog() here. ImGuiDialog's constructor
+    // already self-adds (imgui_dialog.cpp:22), so an explicit AddDialog is
+    // redundant -- and worse, it UNDOES the ctor-time RemoveDialog each overlay
+    // uses to stay unregistered until it is actually shown (M3.147). Adding it
+    // back re-pins the presenter to the UI thread and the blue/black boot
+    // failures return; that is exactly what a first attempt at this got wrong.
+    new FpsOverlayDialog(drawer);
+    new CheatsDialog(drawer);
+    new TrophyOverlayDialog(drawer);
+    // Attract-mode video needs the immediate drawer to blit frames.
+    // (No AddDialog here -- see the note above; the ctor self-adds.)
+    new VideoOverlayDialog(drawer, immediate_drawer());
   }
-
-  // Load Salsbury (the game's cloth-lettering font) for the difficulty panel.
-  // Runs before the atlas is built; searched with the same walk-up used for
-  // the game data root so it works from any launch directory.
-  void OnConfigureFonts(ImFontAtlas* atlas) override {
-    const std::filesystem::path ttf = FindAssetFile(
-        std::filesystem::path("fonts") / "Salsbury Regular" / "Salsbury Regular.ttf");
-    if (!ttf.empty()) {
-      g_salsbury_font = atlas->AddFontFromFileTTF(ttf.string().c_str(), 48.0f);
-    }
-  }
-
-  // Find assets/<rel> with the same walk-up used for the game data root, so
-  // it works from any launch directory. Empty path if not found.
-  static std::filesystem::path FindAssetFile(const std::filesystem::path& rel) {
-    std::error_code ec;
-    for (std::filesystem::path base :
-         {std::filesystem::current_path(ec), rex::filesystem::GetExecutableFolder()}) {
-      for (; !base.empty(); base = base.parent_path()) {
-        std::filesystem::path candidate = base / "assets" / rel;
-        if (std::filesystem::exists(candidate, ec)) {
-          return candidate;
-        }
-        if (base == base.parent_path()) {
-          break;
-        }
-      }
-    }
-    return {};
-  }
+  // (DifficultyDialog and its Salsbury font loader were removed with the fork
+  // feature -- see the note at the former include site.)
 
   // Default the game data root to the project's assets folder when
   // --game_data_root isn't passed on the command line. The new SDK leaves
@@ -120,9 +239,6 @@ class RestuffApp : public rex::ReXApp {
   // this the exe wouldn't find Default.xex unless launched from a folder that
   // already has an assets/ next to it.
   void OnConfigurePaths(rex::PathConfig& paths) override {
-    // The new-profile watcher (difficulty auto-show) scans the save root.
-    set_user_data_root(paths.user_data_root);
-
     if (!paths.game_data_root.empty()) {
       return;  // honor an explicit --game_data_root
     }
@@ -146,9 +262,4 @@ class RestuffApp : public rex::ReXApp {
       }
     }
   }
-
- private:
-  // Keeps the difficulty panel's background upload alive for the app's life
-  // (the dialog only holds the raw ImTextureID).
-  std::unique_ptr<rex::ui::ImmediateTexture> panel_bg_tex_;
 };
