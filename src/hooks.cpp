@@ -1608,6 +1608,22 @@ inline void apply_sky_identity(uint8_t* base, uint32_t rec) {
     wr_f32(base, rec + 24, 0.f);   // G add
     wr_f32(base, rec + 32, 0.f);   // B add
 }
+// Hide a shape completely: zero every channel AND alpha so it's fully
+// transparent. Used for the top warm-overlay shape (cid 15) which must not
+// block the game's red "bad effect" texture overlay that sits on/above it.
+// The blue sky appearance comes from cid 13 (blue base) + cid 14 (native
+// artwork) below, so the warm overlay shape isn't needed for color.
+inline void apply_sky_hide(uint8_t* base, uint32_t rec) {
+    base[rec + 87] = 1;
+    wr_f32(base, rec + 12, 0.f);   // R mul
+    wr_f32(base, rec + 20, 0.f);   // G mul
+    wr_f32(base, rec + 28, 0.f);   // B mul
+    wr_f32(base, rec + 16, 0.f);   // R add
+    wr_f32(base, rec + 24, 0.f);   // G add
+    wr_f32(base, rec + 32, 0.f);   // B add
+    wr_f32(base, rec + 36, 0.f);   // A mul = 0 (fully transparent)
+    wr_f32(base, rec + 40, 0.f);   // A add = 0
+}
 // True for the warm day-sky tint cxform: a strongly warm ADD term (high red,
 // low blue). The title's yellow is NOT a solid fill -- it's cid 14 placed with
 // mul=(0.50,0.61,0.12) add=(176,111,23) over the blue felt, and the timeline
@@ -1650,6 +1666,19 @@ static inline void force_sky_cxform(uint8_t* base, uint32_t rec, uint32_t stream
     if (!is_sky_cid(cid)) {
         warm = warm_tint_cxform(base, rec);
         if (!warm) return;
+    } else if (base[rec + 87] != 0) {
+        // Sky CID with a cxform already present: only recolor if the cxform
+        // is actually the yellow day-sky tint.  Any NON-yellow cxform (the
+        // red "bad effect" texture-swap tint, fade ramps, identity resets,
+        // intermediate tween values) must pass through untouched so the
+        // game's dramatic effect stays visible until the game swaps back.
+        if (!warm_tint_cxform(base, rec)) {
+            if (REXCVAR_GET(sky_recolor_debug))
+                REXLOG_INFO("[sky] SKIPPED non-yellow cxform on cid={} mul=({:.2f},{:.2f},{:.2f}) add=({:.0f},{:.0f},{:.0f})",
+                            cid, rd_f32(base, rec + 12), rd_f32(base, rec + 20), rd_f32(base, rec + 28),
+                            rd_f32(base, rec + 16), rd_f32(base, rec + 24), rd_f32(base, rec + 32));
+            return;
+        }
     }
     if (!stream_is_startmenu(base, stream)) return;
     if (REXCVAR_GET(sky_recolor_debug))
@@ -1660,9 +1689,13 @@ static inline void force_sky_cxform(uint8_t* base, uint32_t rec, uint32_t stream
     // cid 14 is the pre-composited title ARTWORK BITMAP (blue sky baked in),
     // shown yellow only via a warm tint; strip the tint (identity) so the
     // artwork keeps its texture. Same for cid-less warm-tint records (they tint
-    // that bitmap). Only the felt SHAPES (13, 15) take the solid menu blue.
+    // that bitmap). cid 13 (base) takes the solid menu blue. cid 15 (warm
+    // overlay, TOP layer) is hidden (alpha=0) so it can't block the game's
+    // red "bad effect" overlay that sits on/above the artwork.
     if (warm || cid == REXCVAR_GET(sky_cid_art))
         apply_sky_identity(base, rec);
+    else if (cid == REXCVAR_GET(sky_cid2))
+        apply_sky_hide(base, rec);
     else
         apply_sky_blue(base, rec);
 }
