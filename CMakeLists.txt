@@ -20,6 +20,7 @@ set(RESTUFF_SOURCES
     src/renderer/guest_texture_decode.cpp # M1.2b Xenos texture untile + CPU decode to RGBA8
     src/renderer/ucode_translator.cpp    # M2.3 Xenos microcode -> GLSL translator
     src/renderer/shader_pipeline.cpp     # M2.3 runtime GLSL -> SPIR-V (libshaderc) + shader cache
+    src/renderer/texture_mods.cpp        # texture dump (TGA) + replacement, keyed by content hash
 )
 if(WIN32)
     # C23 roundeven* for the recompiler's PPC round-to-even ops; the msvc-wine
@@ -102,7 +103,9 @@ target_link_libraries(restuff PRIVATE ${SHADERC_SHARED_LIB})
 # MP4 and XAudio2 plays its audio track. Windows-only feature, so the Linux
 # build links nothing extra and video_player.h compiles its no-op path.
 if(WIN32)
-    target_link_libraries(restuff PRIVATE mfplat mfreadwrite mfuuid xaudio2)
+    # windowscodecs: WIC decodes texture replacements (texture_mods/<hash>.png
+    # and anything else the user's editor saved) without a thirdparty decoder.
+    target_link_libraries(restuff PRIVATE mfplat mfreadwrite mfuuid xaudio2 windowscodecs)
 endif()
 if(WIN32)
     # Cross build: shaderc headers ship beside the prebuilt .lib (Linux gets
@@ -151,6 +154,9 @@ endfunction()
 restuff_embed_shader(draw2d.vert kDraw2DVS)
 restuff_embed_shader(draw2d_quad.frag kDraw2DQuadFS)
 restuff_embed_shader(draw2d_text.frag kDraw2DTextFS)
+restuff_embed_shader(scene_cel.vert kSceneCelVS)
+restuff_embed_shader(scene_cel.frag kSceneCelFS)
+restuff_embed_shader(display_adjust.frag kDisplayAdjustFS)
 add_custom_target(restuff_shaders DEPENDS ${RESTUFF_SHADER_HEADERS})
 add_dependencies(restuff restuff_shaders)
 target_include_directories(restuff PRIVATE ${RESTUFF_SHADER_GEN})

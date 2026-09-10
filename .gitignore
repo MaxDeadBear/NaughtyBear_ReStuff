@@ -20,3 +20,9 @@ CMakeUserPresets.json
 # rexglue.cmake is SDK boilerplate but carries our local M4.28 patch and
 # defines rexglue_setup_target -- configure fails without it.
 !/generated/rexglue.cmake
+
+# Local development artifacts
+backups/
+tools/padlogs/
+tools/refs/
+tools/__pycache__/

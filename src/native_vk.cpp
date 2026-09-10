@@ -46,6 +46,8 @@ static void restuff_cblip_beep() {}
 #include "renderer/guest_texture_decode.h"
 #include "renderer/native_backend_vk.h"
 #include "renderer/shader_pipeline.h"
+#include "renderer/scene_effect_boundary.h"
+#include "renderer/texture_mods.h"
 #include "renderer/up_draws.h"
 
 // glslc-compiled SPIR-V, embedded as alignas(4) uint32_t arrays at build time
@@ -53,6 +55,9 @@ static void restuff_cblip_beep() {}
 #include <draw2d.vert.spv.h>
 #include <draw2d_quad.frag.spv.h>
 #include <draw2d_text.frag.spv.h>
+#include <scene_cel.vert.spv.h>
+#include <scene_cel.frag.spv.h>
+#include <display_adjust.frag.spv.h>
 
 // hooks.cpp (M3.188): time-based late watchpoint arm, checked from our
 // per-frame loop below — the one site proven hot for the whole run (the
@@ -67,6 +72,19 @@ REXCVAR_DEFINE_BOOL(use_native_renderer, true, "Renderer",
                     "Render through the native Vulkan graphics system instead of the "
                     "xenos GPU emulation plugin.");
 REXCVAR_DECLARE(bool, use_translated_shaders);  // defined in native_backend_vk.cpp
+REXCVAR_DECLARE(bool, tex_dump);                // defined in renderer/texture_mods.cpp
+REXCVAR_DEFINE_BOOL(cel_shading, false, "Modding",
+    "Experimental cel-style frame effect (includes HUD/menus). Toggle live.");
+REXCVAR_DEFINE_INT32(cel_bands, 5, "Modding",
+    "Brightness bands for the cel effect; fewer bands give a flatter look.").range(2, 12);
+REXCVAR_DEFINE_DOUBLE(cel_strength, 0.75, "Modding",
+    "Cel brightness band strength (0 = original, 1 = full bands).").range(0.0, 1.0);
+REXCVAR_DEFINE_DOUBLE(cel_edges, 0.35, "Modding",
+    "Dark image-edge strength for the cel effect (0 disables edges).").range(0.0, 1.0);
+REXCVAR_DEFINE_DOUBLE(display_brightness, 1.0, "Display",
+    "Native renderer brightness. 1 = original; higher is brighter. Changes live.").range(0.25, 2.0);
+REXCVAR_DEFINE_DOUBLE(display_gamma, 1.0, "Display",
+    "Native renderer gamma. 1 = original; higher lifts midtones. Changes live.").range(0.5, 3.0);
 
 namespace restuff::native { uint64_t CurrentPsHashForDebug(); }
 namespace restuff {
@@ -90,6 +108,14 @@ struct TexEntry {
   VkImageView view = VK_NULL_HANDLE;
   VkDescriptorSet set = VK_NULL_HANDLE;  // allocate-only (no vkFreeDescriptorSets in the table)
   uint64_t content_hash = 0;
+  // Live texture-mod reload. mod_gen is the GLOBAL generation this entry was
+  // last validated against -- a cheap gate, since an entry carrying the
+  // current global generation cannot be stale. hash_gen is the per-hash
+  // generation it was actually built from; that is what decides staleness
+  // when the gate misses, so a save invalidates only the edited texture
+  // rather than re-decoding the whole corpus.
+  uint32_t mod_gen = 0;
+  uint32_t hash_gen = 0;
   uint32_t width = 0, height = 0;
   // M4.36: actual device-memory footprint of `image` (vkGetImageMemoryRequirements
   // at create time). Feeds RESTUFF_TEXCENSUS -- on a shared-memory handheld the
@@ -107,6 +133,10 @@ struct TexEntry {
   // refresh additionally requires this to match -- a BC<->RGBA flip (device
   // path change or format change at one address) must take the recreate path.
   VkFormat vkfmt = VK_FORMAT_UNDEFINED;
+  // Mip levels held by `image`. >1 only for texture replacements, which are
+  // often upscaled far past the guest size and thrash the GPU texture cache
+  // without a pyramid. Guest textures keep the single-level fast path.
+  uint32_t mip_levels = 1;
   bool is_depth = false;  // D32_SFLOAT resolve target (depth aspect), not color
   // M4.4: depth rt_tex entries are also usable as depth attachments (the
   // single-pass depth-fill resolve renders into them). Both lazily created on
@@ -128,6 +158,9 @@ struct PendingUpload {
   VkDeviceMemory staging_mem = VK_NULL_HANDLE;
   VkImage image = VK_NULL_HANDLE;
   uint32_t width = 0, height = 0;
+  // >1 means the staging buffer holds level 0 followed by every smaller
+  // level contiguously; the recorder emits one copy region per level.
+  uint32_t mip_levels = 1;
 };
 
 struct CachedFb {
@@ -180,6 +213,11 @@ struct DrawLayer {
   // Point-sampled variant for depth resolve targets (D32 depth images can't be
   // linearly filtered, and depth values must not be blended).
   VkSampler sampler_nearest = VK_NULL_HANDLE;  // borrowed, do NOT destroy
+  // OWNED (unlike the three above): the borrowed UI samplers leave
+  // minLod/maxLod at 0, which clamps sampling to level 0 -- a mip chain
+  // through them would cost memory and never be read. Created ONCE at init.
+  VkSampler sampler_mip = VK_NULL_HANDLE;
+  VkSampler sampler_mip_repeat = VK_NULL_HANDLE;
 
   // One host-visible vertex buffer, grown as needed, persistently mapped.
   VkBuffer vb = VK_NULL_HANDLE;
@@ -649,6 +687,33 @@ bool CreateDrawLayer(vk::VulkanProvider& provider) {
   dl.sampler_nearest =
       provider.ui_samplers()->samplers()[vk::UISamplers::kSamplerIndexNearestClampToEdge];
 
+  // Mip-capable samplers for texture replacements. The SDK's caution about
+  // maxSamplerAllocationCount is about per-texture/dynamic allocation; these
+  // are exactly two, created once for the device lifetime, against a limit
+  // that is >= 4000. Everything else still uses the borrowed UI samplers.
+  {
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.minLod = 0.0f;
+    sci.maxLod = VK_LOD_CLAMP_NONE;  // the whole point: UI samplers pin this to 0
+    if (dev->properties().samplerAnisotropy) {
+      sci.anisotropyEnable = VK_TRUE;
+      sci.maxAnisotropy = std::min(8.0f, dev->properties().maxSamplerAnisotropy);
+    }
+    sci.addressModeU = sci.addressModeV = sci.addressModeW =
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (df.vkCreateSampler(device, &sci, nullptr, &dl.sampler_mip) != VK_SUCCESS)
+      dl.sampler_mip = VK_NULL_HANDLE;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    if (df.vkCreateSampler(device, &sci, nullptr, &dl.sampler_mip_repeat) != VK_SUCCESS)
+      dl.sampler_mip_repeat = VK_NULL_HANDLE;
+    REXLOG_INFO("[native_vk] mip samplers {} (aniso {:.0f}x)",
+                dl.sampler_mip ? "ready" : "FAILED - replacements will not mip",
+                sci.anisotropyEnable ? sci.maxAnisotropy : 1.0f);
+  }
+
   // M3.100: present-time gamma-ramp pipeline. The guest programs a display
   // gamma curve through the DC_LUT registers; the 360's display controller
   // applies it at scanout and the SDK reference bakes it into the front
@@ -670,13 +735,15 @@ bool CreateDrawLayer(vk::VulkanProvider& provider) {
     if (df.vkCreateDescriptorSetLayout(device, &lci, nullptr, &dl.gamma_lut_layout) ==
         VK_SUCCESS) {
       const VkDescriptorSetLayout gsets[2] = {dl.ds_layout, dl.gamma_lut_layout};
-      const VkPushConstantRange gpc = {VK_SHADER_STAGE_VERTEX_BIT, 0, 16};
+      const VkPushConstantRange gpc[] = {
+          {VK_SHADER_STAGE_VERTEX_BIT, 0, 16},
+          {VK_SHADER_STAGE_FRAGMENT_BIT, 16, 16}};
       VkPipelineLayoutCreateInfo gpl = {};
       gpl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
       gpl.setLayoutCount = 2;
       gpl.pSetLayouts = gsets;
-      gpl.pushConstantRangeCount = 1;
-      gpl.pPushConstantRanges = &gpc;
+      gpl.pushConstantRangeCount = 2;
+      gpl.pPushConstantRanges = gpc;
       df.vkCreatePipelineLayout(device, &gpl, nullptr, &dl.gamma_pipeline_layout);
     }
     VkImageCreateInfo ici = {};
@@ -735,17 +802,6 @@ bool CreateDrawLayer(vk::VulkanProvider& provider) {
         "layout(location=3) in vec4 a_col2;\n"
         "layout(location=0) out vec2 v_uv;\n"
         "void main(){ v_uv = a_uv; gl_Position = vec4(a_pos * pc.so.xy + pc.so.zw, 0.0, 1.0); }\n";
-    static const char* kGammaFS =
-        "#version 450\n"
-        "layout(set=0, binding=0) uniform sampler2D srcTex;\n"
-        "layout(set=1, binding=0) uniform sampler2D lutTex;\n"
-        "layout(location=0) in vec2 v_uv;\n"
-        "layout(location=0) out vec4 o;\n"
-        "void main(){ vec4 c = texture(srcTex, v_uv);\n"
-        "  vec3 u = c.rgb * (255.0/256.0) + (0.5/256.0);\n"
-        "  o = vec4(texture(lutTex, vec2(u.r, 0.5)).r,\n"
-        "           texture(lutTex, vec2(u.g, 0.5)).g,\n"
-        "           texture(lutTex, vec2(u.b, 0.5)).b, 1.0); }\n";
     // M3.291/M3.292: tone-matched FS variant for 3D-scene frames only. The
     // user's matched-camera pair fits ours = 0.827 * reference^0.726 (shadow
     // SHAPES agree; the whole scene differs by one flatter display curve), so
@@ -774,10 +830,9 @@ bool CreateDrawLayer(vk::VulkanProvider& provider) {
         double(tg), double(tp));
     }
     auto gvs = renderer::spc::CompileGlsl(kGammaVS, /*is_vertex=*/true);
-    auto gfs = renderer::spc::CompileGlsl(kGammaFS, /*is_vertex=*/false);
-    if (dl.gamma_set && !gvs.empty() && !gfs.empty()) {
+    if (dl.gamma_set && !gvs.empty()) {
       VkShaderModule gvm = vk::util::CreateShaderModule(dev, gvs.data(), gvs.size() * 4);
-      VkShaderModule gfm = vk::util::CreateShaderModule(dev, gfs.data(), gfs.size() * 4);
+      VkShaderModule gfm = vk::util::CreateShaderModule(dev, kDisplayAdjustFS, sizeof(kDisplayAdjustFS));
       if (gvm && gfm) {
         VkPipelineShaderStageCreateInfo gst[2] = {};
         gst[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -954,7 +1009,8 @@ VkDescriptorSet LookupRtTex(uint32_t phys);
 // pass their tightly-packed block-stream size instead (the copy region is
 // still {w,h} texels -- Vulkan sizes compressed copies by extent).
 bool StageTexUpload(vk::VulkanDevice* dev, VkImage image, uint32_t w, uint32_t h,
-                    const uint8_t* rgba, VkDeviceSize data_bytes = 0) {
+                    const uint8_t* rgba, VkDeviceSize data_bytes = 0,
+                    uint32_t mip_levels = 1) {
   auto& dl = DL();
   const auto& df = dev->functions();
   VkDevice device = dev->device();
@@ -963,6 +1019,7 @@ bool StageTexUpload(vk::VulkanDevice* dev, VkImage image, uint32_t w, uint32_t h
   up.image = image;
   up.width = w;
   up.height = h;
+  up.mip_levels = mip_levels;
   uint32_t staging_type = 0;
   VkDeviceSize staging_size = 0;
   if (!vk::util::CreateDedicatedAllocationBuffer(dev, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -987,7 +1044,8 @@ bool StageTexUpload(vk::VulkanDevice* dev, VkImage image, uint32_t w, uint32_t h
 // path passes BC1/2/3 [_SRGB]); data_bytes rides through to StageTexUpload.
 bool CreateTexEntry(vk::VulkanDevice* dev, TexEntry& t, const uint8_t* rgba, uint32_t w,
                     uint32_t h, bool wrap = false, bool srgb = false,
-                    VkFormat explicit_fmt = VK_FORMAT_UNDEFINED, VkDeviceSize data_bytes = 0) {
+                    VkFormat explicit_fmt = VK_FORMAT_UNDEFINED, VkDeviceSize data_bytes = 0,
+                    uint32_t mip_levels = 1) {
   auto& dl = DL();
   const auto& df = dev->functions();
   VkDevice device = dev->device();
@@ -1007,7 +1065,12 @@ bool CreateTexEntry(vk::VulkanDevice* dev, TexEntry& t, const uint8_t* rgba, uin
   img_ci.imageType = VK_IMAGE_TYPE_2D;
   img_ci.format = tex_fmt;
   img_ci.extent = {w, h, 1};
-  img_ci.mipLevels = 1;
+  // A mip chain needs a sampler that can read past level 0; without one the
+  // extra levels are pure cost, so fall back to a flat image. (No
+  // TRANSFER_SRC needed: levels arrive prebuilt from the CPU, not via blit.)
+  if (mip_levels > 1 && (wrap ? dl.sampler_mip_repeat : dl.sampler_mip) == VK_NULL_HANDLE)
+    mip_levels = 1;
+  img_ci.mipLevels = mip_levels;
   img_ci.arrayLayers = 1;
   img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
   img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -1038,8 +1101,9 @@ bool CreateTexEntry(vk::VulkanDevice* dev, TexEntry& t, const uint8_t* rgba, uin
     t.set = AcquireTexSet(dev);
     if (t.set == VK_NULL_HANDLE) return false;
   }
-  VkDescriptorImageInfo dii = {wrap ? dl.sampler_repeat : dl.sampler, t.view,
-                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  const VkSampler smp = mip_levels > 1 ? (wrap ? dl.sampler_mip_repeat : dl.sampler_mip)
+                                       : (wrap ? dl.sampler_repeat : dl.sampler);
+  VkDescriptorImageInfo dii = {smp, t.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
   VkWriteDescriptorSet wds = {};
   wds.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   wds.dstSet = t.set;
@@ -1051,10 +1115,11 @@ bool CreateTexEntry(vk::VulkanDevice* dev, TexEntry& t, const uint8_t* rgba, uin
 
   // Staging buffer, filled now; the copy is recorded at the head of this
   // frame's command buffer.
-  if (!StageTexUpload(dev, t.image, w, h, rgba, data_bytes)) return false;
+  if (!StageTexUpload(dev, t.image, w, h, rgba, data_bytes, mip_levels)) return false;
 
   t.width = w;
   t.height = h;
+  t.mip_levels = mip_levels;
   t.srgb = tex_fmt == VK_FORMAT_R8G8B8A8_SRGB || tex_fmt == VK_FORMAT_BC1_RGBA_SRGB_BLOCK ||
            tex_fmt == VK_FORMAT_BC2_SRGB_BLOCK || tex_fmt == VK_FORMAT_BC3_SRGB_BLOCK;
   t.vkfmt = tex_fmt;  // M4.3
@@ -1202,11 +1267,22 @@ const TexEntry* ResolveTextureEntry(vk::VulkanDevice* dev, const renderer::Guest
     if (fresh) mit->second = renderer::GuestTextureContentHash(tex);
     hash = mit->second;
   }
+  const uint32_t mod_gen = renderer::texmod::ModGeneration();
   auto it = dl.textures.find(key);
   if (it != dl.textures.end() && it->second.content_hash == hash &&
       it->second.image != VK_NULL_HANDLE) {
-    it->second.last_used_frame = dl.frames_rendered.load(std::memory_order_relaxed);  // M4.36
-    return &it->second;
+    // One atomic load on the hot path. The per-hash table is touched only in
+    // the window after a mod-folder change, once per texture, and the entry
+    // is then re-stamped so it returns to the fast gate.
+    bool current = it->second.mod_gen == mod_gen;
+    if (!current && it->second.hash_gen == renderer::texmod::ModGenerationFor(hash)) {
+      it->second.mod_gen = mod_gen;
+      current = true;
+    }
+    if (current) {
+      it->second.last_used_frame = dl.frames_rendered.load(std::memory_order_relaxed);  // M4.36
+      return &it->second;
+    }
   }
   if (it != dl.textures.end()) {
     static std::atomic<int> s_restuff_budget{40};
@@ -1221,13 +1297,32 @@ const TexEntry* ResolveTextureEntry(vk::VulkanDevice* dev, const renderer::Guest
   // their byteswapped+untiled blocks straight into BC1/2/3 images -- no CPU
   // palette decode, 4-8x fewer upload bytes. RESTUFF_NO_BC=1 forces the CPU
   // decode; the DUMP_TEX diagnostics do too (they inspect decoded RGBA).
+  // Texture replacement, keyed by CONTENT hash rather than phys_addr: guest
+  // heap addresses are reused across scenes (that is what the cache above
+  // exists to notice), so an address key would apply a mod to whatever
+  // texture later lands in the same slot. Returns null unless
+  // tex_mods is enabled and a replacement is ready, and caches misses.
+  // shared_ptr: render threads read this while the loader invalidates cached
+  // data, so the entry must stay alive for as long as it is used here.
+  // Null simply means "not decoded yet" -- draw the guest texture; the
+  // loader bumps the generation and it re-resolves when ready.
+  uint32_t hash_gen = 0;
+  const auto repl = renderer::texmod::FindReplacement(hash, &hash_gen);
   static const bool s_no_bc = getenv("RESTUFF_NO_BC") != nullptr;
+  // Latched, not live: it also gates the native-BC veto below, and flipping
+  // that mid-session would dump raw BC blocks as if they were RGBA. Set it in
+  // restuff.toml (read at the first texture upload, after config load).
+  static const bool s_tex_dump =
+      REXCVAR_GET(tex_dump) || getenv("RESTUFF_TEX_DUMP") != nullptr;
   static const bool s_dump_tex_any =
-      getenv("RESTUFF_DUMP_TEX") != nullptr || getenv("RESTUFF_DUMP_TEX_RAW") != nullptr;
+      getenv("RESTUFF_DUMP_TEX") != nullptr || getenv("RESTUFF_DUMP_TEX_RAW") != nullptr ||
+      s_tex_dump;
   static const bool s_no_srgb_fmt = getenv("RESTUFF_NO_SRGB") != nullptr;
   const bool is_dxt = tex.format == 18 || tex.format == 19 || tex.format == 20;
+  // ... and a replacement forces the CPU/RGBA8 path for the same reason the
+  // dump diagnostics do: both need decoded texels, not raw BC blocks.
   const bool use_bc = is_dxt && dev->properties().textureCompressionBC && !s_no_bc &&
-                      !s_dump_tex_any;
+                      !s_dump_tex_any && !repl;
   VkFormat bc_fmt = VK_FORMAT_UNDEFINED;
   if (use_bc) {
     const bool sr = tex.gamma && !s_no_srgb_fmt;
@@ -1245,9 +1340,52 @@ const TexEntry* ResolveTextureEntry(vk::VulkanDevice* dev, const renderer::Guest
   }
   std::vector<uint8_t> rgba;  // RGBA8 texels, or the BC block stream (M4.3)
   uint32_t w = 0, h = 0;
-  const bool decoded = use_bc ? renderer::CopyGuestBCBlocks(tex, rgba, w, h)
-                              : renderer::DecodeGuestTexture(tex, rgba, w, h);
+  // With a replacement already in hand the guest pixels are only needed for a
+  // dump, so skip the CPU decode entirely otherwise -- it was running on the
+  // frame path ~900 times a session purely to be thrown away.
+  const bool need_guest = !repl || s_dump_tex_any;
+  const bool decoded = !need_guest
+                           ? true
+                           : (use_bc ? renderer::CopyGuestBCBlocks(tex, rgba, w, h)
+                                     : renderer::DecodeGuestTexture(tex, rgba, w, h));
 
+  // RESTUFF_TEX_DUMP=1: one TGA per distinct CONTENT hash. The older
+  // RESTUFF_DUMP_TEX above is keyed by address and fires once per address,
+  // so it silently skips every texture that reuses a slot -- this does not.
+  if (s_tex_dump && w && h && !rgba.empty()) {
+    static std::set<uint64_t> s_tga_dumped;
+    // The in-process set stops repeat work within a run; DumpExists stops the
+    // whole corpus being rewritten on every launch. Set membership is checked
+    // first so the filesystem is touched at most once per texture per run.
+    if (s_tga_dumped.insert(hash).second && !renderer::texmod::DumpExists(hash)) {
+      const auto name = renderer::texmod::HashName(hash);
+      // Extension follows the tex_dump_format cvar (tga or png).
+      renderer::texmod::WriteDump(hash, rgba.data(), w, h);
+      static std::atomic<int> s_dump_budget{20};
+      if (s_dump_budget.fetch_sub(1, std::memory_order_relaxed) > 0)
+        REXLOG_INFO("[texmod] dumped {} ({}x{} fmt={} addr=0x{:08X})", name, w, h, tex.format,
+                    tex.phys_addr);
+    }
+  }
+  // Swap in the replacement AFTER dumping (so a dump run still captures the
+  // ORIGINAL art) but BEFORE the in-place refresh below -- that path uploads
+  // `rgba` and returns early, so with the swap after it a modded texture that
+  // took the fast path re-uploaded the guest pixels and the replacement never
+  // reached the screen. Guest UVs are normalised, so a different (e.g.
+  // upscaled) size needs nothing else changed.
+  // Upload source. For a replacement this POINTS AT the pyramid the loader
+  // thread already built -- no rebuild and no copy on the frame path. `repl`
+  // is a shared_ptr held for this whole function, so the data stays alive.
+  const uint8_t* up_data = rgba.data();
+  VkDeviceSize up_bytes = use_bc ? VkDeviceSize(rgba.size()) : 0;
+  uint32_t mip_levels = 1;
+  if (repl) {
+    w = repl->w;
+    h = repl->h;
+    up_data = repl->rgba.data();
+    up_bytes = VkDeviceSize(repl->rgba.size());
+    mip_levels = repl->mip_levels;
+  }
   if (it != dl.textures.end()) {
     // M4.0: content changed but the shape didn't -- refresh the EXISTING image
     // in place instead of destroy+recreate. The upload records at the head of
@@ -1268,10 +1406,26 @@ const TexEntry* ResolveTextureEntry(vk::VulkanDevice* dev, const renderer::Guest
     const VkFormat want_fmt =
         use_bc ? bc_fmt : (want_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
     if (!s_no_inplace && decoded && e.image != VK_NULL_HANDLE && e.width == w &&
-        e.height == h && e.vkfmt == want_fmt &&
-        StageTexUpload(dev, e.image, w, h, rgba.data(),
-                       use_bc ? VkDeviceSize(rgba.size()) : 0)) {
+        e.height == h && e.vkfmt == want_fmt && e.mip_levels == mip_levels &&
+        StageTexUpload(dev, e.image, w, h, up_data, up_bytes, mip_levels)) {
       e.content_hash = hash;
+      // An in-place refresh must re-stamp the texture-mod generations too.
+      // Without this the entry stays permanently stale: the cache check fails
+      // every frame, re-decodes, refreshes in place, and fails again -- a
+      // per-frame re-decode loop. It only showed up when the VkFormat did NOT
+      // change across the toggle (e.g. tex_dump on, which disables BC upload,
+      // so both states are RGBA8 and this fast path is always eligible).
+      e.mod_gen = mod_gen;
+      e.hash_gen = hash_gen;
+      // Proof the fast path carries MODDED pixels: before the swap was moved
+      // above this block, an in-place refresh re-uploaded the guest texture
+      // and the replacement never reached the screen.
+      if (repl) {
+        static std::atomic<int> s_ip_repl_budget{8};
+        if (s_ip_repl_budget.fetch_sub(1, std::memory_order_relaxed) > 0)
+          REXLOG_INFO("[texmod] in-place refresh uploaded REPLACEMENT {} ({}x{})",
+                      renderer::texmod::HashName(hash), w, h);
+      }
       // M4.37: an in-place refresh IS a use -- without this the entry looks
       // permanently cold to the LRU sweep and gets evicted while hot.
       e.last_used_frame = dl.frames_rendered.load(std::memory_order_relaxed);
@@ -1331,13 +1485,14 @@ const TexEntry* ResolveTextureEntry(vk::VulkanDevice* dev, const renderer::Guest
     }
   }
   TexEntry t;
-  if (!CreateTexEntry(dev, t, rgba.data(), w, h, wrap, tex.gamma,
-                      use_bc ? bc_fmt : VK_FORMAT_UNDEFINED,
-                      use_bc ? VkDeviceSize(rgba.size()) : 0)) {
+  if (!CreateTexEntry(dev, t, up_data, w, h, wrap, tex.gamma,
+                      use_bc ? bc_fmt : VK_FORMAT_UNDEFINED, up_bytes, mip_levels)) {
     DestroyTexEntry(dev, t);
     return nullptr;
   }
   t.content_hash = hash;
+  t.mod_gen = mod_gen;
+  t.hash_gen = hash_gen;
   static std::atomic<int> s_srgb_cnt{0}, s_lin_cnt{0};
   const int g_after = tex.gamma ? s_srgb_cnt.fetch_add(1, std::memory_order_relaxed) + 1
                                 : (s_lin_cnt.fetch_add(1, std::memory_order_relaxed), -1);
@@ -5014,13 +5169,10 @@ bool EnsureSceneTarget(vk::VulkanDevice* dev) {
     REXLOG_ERROR("[native_vk] M3.89 writeback buffer map failed (writeback disabled)");
   }
 
-  // M3.293: scene-tone pass objects. The tone is a scene property (fitted on
-  // gameplay content vs the user's endorsed reference), applied to the scene
-  // RT at the 3D->UI boundary inside the frame -- NEVER at present, and never
-  // by frame-level heuristics (a draw-count gate fried episode select; a
-  // global present curve fried the title). Skipped entirely under
-  // RESTUFF_NO_TONE=1.
-  if (getenv("RESTUFF_SCENE_TONE")) {  // M3.293 parked opt-in (see boundary note)
+  // Scene post-process resources are prepared once for live cel toggling.
+  // The pass is recorded only when cel shading or the opt-in tone is enabled.
+  // Cel uses the final front-buffer resolve; the legacy tone uses its UI boundary.
+  {
     VkImageCreateInfo tci = {};
     tci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     tci.imageType = VK_IMAGE_TYPE_2D;
@@ -5056,6 +5208,9 @@ bool EnsureSceneTarget(vk::VulkanDevice* dev) {
       tpl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
       tpl.setLayoutCount = 1;
       tpl.pSetLayouts = &tl.tone_set_layout;
+      VkPushConstantRange settings = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8 * sizeof(float)};
+      tpl.pushConstantRangeCount = 1;
+      tpl.pPushConstantRanges = &settings;
       df.vkCreatePipelineLayout(device, &tpl, nullptr, &tl.tone_pl_layout);
     }
     if (tl.tone_view && tl.tone_pl_layout) {
@@ -5086,28 +5241,9 @@ bool EnsureSceneTarget(vk::VulkanDevice* dev) {
       }
     }
     if (tl.tone_set) {
-      float tp = 1.377f, tg = 1.209f;
-      if (const char* e = getenv("RESTUFF_TONE_POWER")) tp = float(atof(e));
-      if (const char* e = getenv("RESTUFF_TONE_GAIN")) tg = float(atof(e));
-      static const char* kToneVS =
-          "#version 450\n"
-          "layout(location=0) out vec2 v_uv;\n"
-          "void main(){ vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
-          "  v_uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
-      char tfs[640];
-      std::snprintf(tfs, sizeof(tfs),
-          "#version 450\n"
-          "layout(set=0, binding=0) uniform sampler2D srcTex;\n"
-          "layout(location=0) in vec2 v_uv;\n"
-          "layout(location=0) out vec4 o;\n"
-          "void main(){ vec3 c = texture(srcTex, v_uv).rgb;\n"
-          "  o = vec4(pow(min(c * %f, vec3(1.0)), vec3(%f)), 1.0); }\n",
-          double(tg), double(tp));
-      auto tvs = renderer::spc::CompileGlsl(kToneVS, /*is_vertex=*/true);
-      auto tfsb = renderer::spc::CompileGlsl(tfs, /*is_vertex=*/false);
-      if (!tvs.empty() && !tfsb.empty()) {
-        VkShaderModule vm = vk::util::CreateShaderModule(dev, tvs.data(), tvs.size() * 4);
-        VkShaderModule fm = vk::util::CreateShaderModule(dev, tfsb.data(), tfsb.size() * 4);
+      {
+        VkShaderModule vm = vk::util::CreateShaderModule(dev, kSceneCelVS, sizeof(kSceneCelVS));
+        VkShaderModule fm = vk::util::CreateShaderModule(dev, kSceneCelFS, sizeof(kSceneCelFS));
         if (vm && fm) {
           VkPipelineShaderStageCreateInfo st[2] = {};
           st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -5164,7 +5300,7 @@ bool EnsureSceneTarget(vk::VulkanDevice* dev) {
         if (fm) df.vkDestroyShaderModule(device, fm, nullptr);
       }
     }
-    REXLOG_INFO("[native_vk] M3.293 scene-tone pass {}",
+    REXLOG_INFO("[native_vk] scene tone/cel pass {}",
                 tl.tone_pipeline ? "ready" : "UNAVAILABLE");
   }
 
@@ -5366,9 +5502,29 @@ PFN_vkCmdCopyImage CopyImageFn(vk::VulkanDevice* dev) {
 // Copies scene -> tone scratch, then draws tone(scratch) back over the scene
 // with a fullscreen pipeline (scene_rp_load: LOADs color+depth, writes color
 // only). Runs at the 3D->UI boundary so UI composites onto a toned scene.
-void RecordSceneTone(vk::VulkanDevice* dev, VkCommandBuffer cmd) {
+void RecordSceneTone(vk::VulkanDevice* dev, VkCommandBuffer cmd, bool cel_pass = false) {
   auto& tl = TL();
   if (!tl.tone_pipeline || !tl.tone_set || !tl.tone_img) return;
+  const auto copy_fn = CopyImageFn(dev);
+  if (!copy_fn) return;  // Never sample scratch data if the copy is unavailable.
+  const bool cel = cel_pass && REXCVAR_GET(cel_shading);
+  static const bool tone_requested = getenv("RESTUFF_SCENE_TONE") != nullptr;
+  const bool tone = !cel_pass && tone_requested;
+  if (!cel && !tone) return;
+  static const float tone_gain = [] {
+    const char* e = getenv("RESTUFF_TONE_GAIN");
+    return e ? float(atof(e)) : 1.209f;
+  }();
+  static const float tone_power = [] {
+    const char* e = getenv("RESTUFF_TONE_POWER");
+    return e ? float(atof(e)) : 1.377f;
+  }();
+  const float settings[8] = {
+      tone ? tone_gain : 1.f, tone ? tone_power : 1.f,
+      float(std::clamp(REXCVAR_GET(cel_bands), 2, 12)),
+      cel ? float(std::clamp(REXCVAR_GET(cel_strength), 0.0, 1.0)) : 0.f,
+      cel ? float(std::clamp(REXCVAR_GET(cel_edges), 0.0, 1.0)) : 0.f,
+      1.f / float(kGuestW), 1.f / float(kGuestH), 0.f};
   const auto& df = dev->functions();
   VkImageMemoryBarrier b[2] = {};
   b[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -5393,10 +5549,8 @@ void RecordSceneTone(vk::VulkanDevice* dev, VkCommandBuffer cmd) {
   region.dstSubresource = region.srcSubresource;
   region.extent = {SceneW(), SceneH(), 1};
   // SDK function table lacks vkCmdCopyImage -- M3.129's lazy loader lookup.
-  if (auto copy_fn = CopyImageFn(dev)) {
-    copy_fn(cmd, tl.scene_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tl.tone_img,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-  }
+  copy_fn(cmd, tl.scene_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tl.tone_img,
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
   b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   b[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
   b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -5419,10 +5573,18 @@ void RecordSceneTone(vk::VulkanDevice* dev, VkCommandBuffer cmd) {
   bi.pClearValues = clears;
   df.vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
   df.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tl.tone_pipeline);
+  df.vkCmdPushConstants(cmd, tl.tone_pl_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(settings), settings);
   df.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tl.tone_pl_layout, 0, 1,
                              &tl.tone_set, 0, nullptr);
   df.vkCmdDraw(cmd, 3, 1, 0, 0);
   df.vkCmdEndRenderPass(cmd);
+  if (cel) {
+    static std::atomic<uint32_t> s_cel_draws{0};
+    if (s_cel_draws.fetch_add(1, std::memory_order_relaxed) < 4)
+      REXLOG_INFO("[cel] pass recorded before front-buffer resolve: bands={} strength={} edges={}",
+                  settings[2], settings[3], settings[4]);
+  }
 }
 
 void RecordResolve(vk::VulkanDevice* dev, VkCommandBuffer cmd, const TransDrawRec& r,
@@ -9710,6 +9872,9 @@ void RecordSceneFrame(vk::VulkanDevice* dev, VkCommandBuffer cmd,
                   TranslatedLayer::kAuxSurfaces > 3 ? per_surf[4] : 0, res_n);
     }
   }
+  const size_t cel_resolve = REXCVAR_GET(cel_shading)
+      ? renderer::FindCelResolve(recs, tl.frame_fb ? tl.frame_fb : renderer::GetFrontBufferPhys())
+      : recs.size();
   size_t i = 0;
   while (i < recs.size()) {
     if (recs[i].is_resolve) {
@@ -9731,6 +9896,10 @@ void RecordSceneFrame(vk::VulkanDevice* dev, VkCommandBuffer cmd,
         df.vkCmdEndRenderPass(cmd);
         first = false;
         if (!a) scene_virgin = false;
+      }
+      if (i == cel_resolve) {
+        RecordSceneTone(dev, cmd, /*cel_pass=*/true);
+        GpMark(dev, cmd, kGpTone);
       }
       // M3.25: a DEPTH resolve ends the current depth pass (its result is saved
       // to a depth texture). The next main draw segment therefore begins a new
@@ -10399,7 +10568,9 @@ bool NativeVulkanGraphicsSystem::PresentClearFrame() {
         static const bool s_no_ramp = getenv("RESTUFF_NO_GAMMA_RAMP") != nullptr;
         {
           const uint32_t rv = restuff::native::GetGammaRampVersion();
-          if (!s_no_ramp && dl.gamma_pipeline && rv != 0 && rv != dl.gamma_uploaded_version) {
+          // Keep the LUT image initialized even when its visual effect is
+          // disabled: brightness/gamma share this pipeline and descriptor set.
+          if (dl.gamma_pipeline && rv != 0 && rv != dl.gamma_uploaded_version) {
             uint32_t packed[256];
             restuff::native::CopyGammaRamp(packed);
             PendingUpload up;
@@ -10464,11 +10635,27 @@ bool NativeVulkanGraphicsSystem::PresentClearFrame() {
           df.vkCmdPipelineBarrier(cmd_buf_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                                   &b);
-          VkBufferImageCopy region = {};
-          region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-          region.imageExtent = {up.width, up.height, 1};
+          // One region per mip level; the staging buffer holds level 0 then each
+          // smaller level contiguously (BuildMipChain). With mip_levels == 1 this
+          // is exactly the previous single-region copy. The pyramid is built on
+          // the CPU because vkCmdBlitImage is absent from the SDK function table.
+          std::vector<VkBufferImageCopy> regions;
+          regions.reserve(up.mip_levels);
+          VkDeviceSize level_off = 0;
+          uint32_t lw = up.width, lh = up.height;
+          for (uint32_t lvl = 0; lvl < up.mip_levels; ++lvl) {
+            VkBufferImageCopy region = {};
+            region.bufferOffset = level_off;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lvl, 0, 1};
+            region.imageExtent = {lw, lh, 1};
+            regions.push_back(region);
+            level_off += VkDeviceSize(lw) * lh * 4;
+            lw = lw > 1 ? lw / 2 : 1;
+            lh = lh > 1 ? lh / 2 : 1;
+          }
           df.vkCmdCopyBufferToImage(cmd_buf_, up.staging, up.image,
-                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    uint32_t(regions.size()), regions.data());
           b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
           b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
           b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -10541,23 +10728,30 @@ bool NativeVulkanGraphicsSystem::PresentClearFrame() {
               // has programmed one (identity before that -- skip the LUT).
               const bool use_ramp = !s_no_ramp && dl.gamma_pipeline &&
                                     dl.gamma_uploaded_version != 0;
+              const float display_pc[4] = {
+                  float(std::clamp(REXCVAR_GET(display_brightness), 0.25, 2.0)),
+                  float(std::clamp(REXCVAR_GET(display_gamma), 0.5, 3.0)),
+                  use_ramp ? 1.f : 0.f, 0.f};
+              const bool use_display = dl.gamma_pipeline && dl.gamma_uploaded_version != 0 &&
+                  (use_ramp || display_pc[0] != 1.f || display_pc[1] != 1.f);
               const VkPipelineLayout play =
-                  use_ramp ? dl.gamma_pipeline_layout : dl.pipeline_layout;
+                  use_display ? dl.gamma_pipeline_layout : dl.pipeline_layout;
               df.vkCmdPushConstants(cmd_buf_, play, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc),
                                     pc);
+              if (use_display)
+                df.vkCmdPushConstants(cmd_buf_, play, VK_SHADER_STAGE_FRAGMENT_BIT, 16,
+                                     sizeof(display_pc), display_pc);
               const VkDeviceSize vb_offset = 0;
               df.vkCmdBindVertexBuffers(cmd_buf_, 0, 1, &dl.vb, &vb_offset);
-              // M3.293: tone moved INTO the frame (scene-RT pass at the 3D->UI
-              // boundary; see RecordSceneTone). Present is plain LUT for every
-              // frame -- no frame-level tone selection ever again (a count gate
-              // fried episode select; a global curve fried the title).
+              // Cel is already applied before the front-buffer resolve. This
+              // final draw applies the guest LUT and live display controls.
               df.vkCmdBindPipeline(cmd_buf_, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                   use_ramp
+                                   use_display
                                        ? dl.gamma_pipeline
                                        : dl.pipelines[0][uint32_t(renderer::BlendMode::kPremul)]);
               df.vkCmdBindDescriptorSets(cmd_buf_, VK_PIPELINE_BIND_POINT_GRAPHICS, play, 0, 1,
                                          &it->second.set, 0, nullptr);
-              if (use_ramp)
+              if (use_display)
                 df.vkCmdBindDescriptorSets(cmd_buf_, VK_PIPELINE_BIND_POINT_GRAPHICS, play, 1, 1,
                                            &dl.gamma_set, 0, nullptr);
               df.vkCmdDraw(cmd_buf_, 6, 1, 0, 0);
@@ -10697,6 +10891,8 @@ bool NativeVulkanGraphicsSystem::PresentClearFrame() {
           frame_slot_ ^= 1;
         }
 
+        // Publish live texture-mod toggles; the loader scans the directory.
+        renderer::texmod::PollModDir();
         const uint64_t fr = dl.frames_rendered.fetch_add(1, std::memory_order_relaxed) + 1;
         // RESTUFF_RDOC_TRIGGER=<path>: when the file is non-empty, fire a
         // RenderDoc capture of the next presented frame and truncate the file
