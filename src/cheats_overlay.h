@@ -24,6 +24,14 @@ void set_tex_dump(bool val);
 int  get_tex_dump_format_index();  // 0 = TGA, 1 = PNG
 void set_tex_dump_format_index(int idx);
 
+// Attract video controls
+bool   get_attract_enabled();
+void   set_attract_enabled(bool val);
+double get_attract_delay();
+void   set_attract_delay(double sec);
+double get_attract_idle_time();
+void   play_attract_video();
+
 class CheatsDialog : public rex::ui::ImGuiDialog {
 public:
     explicit CheatsDialog(rex::ui::ImGuiDrawer* drawer)
@@ -91,6 +99,22 @@ public:
             const char* formats[] = { "TGA (.tga)", "PNG (.png)" };
             if (ImGui::Combo("Dump Format", &fmt, formats, 2))
                 set_tex_dump_format_index(fmt);
+
+            ImGui::Separator();
+            ImGui::Text("Attract Trailers:");
+
+            bool att = get_attract_enabled();
+            if (ImGui::Checkbox("Attract Mode Enabled", &att))
+                set_attract_enabled(att);
+
+            float delay_sec = static_cast<float>(get_attract_delay());
+            if (ImGui::SliderFloat("Delay (sec)", &delay_sec, 5.0f, 120.0f, "%.0fs"))
+                set_attract_delay(static_cast<double>(delay_sec));
+
+            ImGui::Text("Idle: %.1fs / %.1fs", get_attract_idle_time(), get_attract_delay());
+            ImGui::SameLine();
+            if (ImGui::Button("Play Now (F7)"))
+                play_attract_video();
         }
         ImGui::End();
     }

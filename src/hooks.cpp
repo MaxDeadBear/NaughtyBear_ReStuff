@@ -150,6 +150,15 @@ static void update_attract(double dt);
 static void update_bearcam();
 static void update_freecam();
 static void maybe_unlock_all();
+
+// Attract-mode startmenu detection: armed once title screen or main menu is seen.
+static std::atomic<bool> g_attract_saw_startmenu{false};
+static inline void arm_attract_timer() {
+    bool expected = false;
+    if (g_attract_saw_startmenu.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        REXLOG_INFO("[video] attract timer armed (front-end reached)");
+    }
+}
 // Set Windows timer resolution to 1ms for the lifetime of the process.
 // Default is 15.6ms which causes sleep_until to overshoot badly. On Linux the
 // monotonic clock/nanosleep are already high-resolution, so this is a no-op.
@@ -1489,6 +1498,7 @@ REX_HOOK_RAW(sub_830B3FC8) {
 // menu sets blue. Rewrite the yellow tag to the cvar-defined blue so the title
 // sky matches. Runs at menu speed (not per-draw), so the cost is irrelevant.
 void on_set_bg_color(PPCRegister& r3) {
+    arm_attract_timer();
     const uint32_t tag = r3.u32;
     if (!ptr_ok(tag)) return;
     auto* mem = rex::system::kernel_memory();
@@ -1731,6 +1741,7 @@ void on_gfx_place(PPCRegister& r29, PPCRegister& r31) {
     if (!mem) return;
     uint8_t* base = mem->virtual_membase();
     if (!base || !host_readable(base, rec) || !host_readable(base, rec + 88)) return;
+    if (stream_is_startmenu(base, r31.u32)) arm_attract_timer();
 
     if (REXCVAR_GET(sky_recolor_debug)) {
         const uint16_t cid = static_cast<uint16_t>((base[rec + 82] << 8) | base[rec + 83]);
@@ -2790,6 +2801,7 @@ static std::filesystem::path pick_attract_video() {
 
 // Start the attract cinematic. Call from anywhere (e.g. an idle timer).
 void play_attract_video() {
+    arm_attract_timer();
     const std::filesystem::path p = pick_attract_video();
     if (p.empty()) {
         REXLOG_WARN("[video] nothing to play: no videos in '{}' and '{}' not found",
@@ -2812,9 +2824,6 @@ REXCVAR_DEFINE_DOUBLE(attract_delay, 45.0, "Video",
 // Seconds since the player last did anything. Written from the input hook (game
 // thread) and the per-frame tick, so keep it atomic.
 static std::atomic<double> g_attract_idle{0.0};
-// Set once the title screen's own load unit ("StartMenu") has streamed in, so
-// the timer can't run during the boot logos before the menu even exists.
-static std::atomic<bool> g_attract_saw_startmenu{false};
 
 // Called whenever a real keystroke is dequeued: the player is present, so reset
 // the timer and drop out of any cinematic that's running.
@@ -2829,7 +2838,7 @@ void note_input_activity() {
 void note_loadunit_activity(const char* name) {
     g_attract_idle.store(0.0, std::memory_order_relaxed);
     if (name && std::strcmp(name, "startmenu") == 0) {
-        g_attract_saw_startmenu.store(true, std::memory_order_relaxed);
+        arm_attract_timer();
     }
 }
 
@@ -2862,7 +2871,16 @@ static void update_attract(double dt) {
         return;
     }
     // Don't count during the boot logos: wait until the title screen exists.
-    if (!g_attract_saw_startmenu.load(std::memory_order_relaxed)) return;
+    // Fallback: after 8 seconds of runtime outside gameplay, consider boot logos done.
+    if (!g_attract_saw_startmenu.load(std::memory_order_relaxed)) {
+        static auto s_boot_start = std::chrono::steady_clock::now();
+        const double boot_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - s_boot_start).count();
+        if (boot_sec >= 8.0) {
+            arm_attract_timer();
+        } else {
+            return;
+        }
+    }
     auto* mem = rex::system::kernel_memory();
     uint8_t* base = mem ? mem->virtual_membase() : nullptr;
     if (base && resolve_player_damageable(base)) {  // in gameplay
@@ -2879,6 +2897,12 @@ static void update_attract(double dt) {
         g_attract_idle.store(t, std::memory_order_relaxed);
     }
 }
+
+bool   get_attract_enabled() { return REXCVAR_GET(attract_enabled); }
+void   set_attract_enabled(bool val) { REXCVAR_SET(attract_enabled, val); }
+double get_attract_delay() { return REXCVAR_GET(attract_delay); }
+void   set_attract_delay(double sec) { REXCVAR_SET(attract_delay, sec); }
+double get_attract_idle_time() { return g_attract_idle.load(std::memory_order_relaxed); }
 
 static const bool s_video_bind_registered = []() {
     rex::ui::RegisterBind("bind_play_video", "F7", "Play attract video",
@@ -8034,6 +8058,7 @@ REX_HOOK_RAW(sub_827CA208) {          // LoadingState
 }
 REX_EXTERN(__imp__sub_827D54C8);
 REX_HOOK_RAW(sub_827D54C8) {          // MenuState
+  arm_attract_timer();
   festate::Hit("CTRL.menu", uint32_t(ctx.lr), 2);
   __imp__sub_827D54C8(ctx, base);
 }
