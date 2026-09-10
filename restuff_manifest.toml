@@ -51,12 +51,6 @@ longjmp_address = 0x830968F0
 0x82F05A1C = { parent = 0x82F054C8 }
 0x82F05A30 = { parent = 0x82F054C8 }
 
-# HazingPlayerManager::CreatePlayer (local co-op M2). Reached only through an
-# indirect call -- its sole static reference is its own .pdata unwind record --
-# so codegen never discovers it and the dispatcher has nothing to look up.
-# Listed here so GetFunction(0x8281C678) resolves for the coop_spawn_test probe.
-0x8281C678 = {}
-
 [[entrypoint.midasm_hook]]
 address = 0x82F33FF4
 name = "on_swap"

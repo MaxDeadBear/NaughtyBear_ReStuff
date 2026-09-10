@@ -164,3 +164,10 @@ bool ModsEnabled();
 }  // namespace texmod
 
 }  // namespace restuff::renderer
+
+// Helpers exposed for UI overlays (e.g. cheats overlay dropdown / checkbox)
+bool get_tex_dump();
+void set_tex_dump(bool val);
+int  get_tex_dump_format_index();  // 0 = TGA, 1 = PNG
+void set_tex_dump_format_index(int idx);
+

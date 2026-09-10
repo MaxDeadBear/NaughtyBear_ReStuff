@@ -2,6 +2,7 @@
 #include <rex/ui/imgui_dialog.h>
 #include <rex/ui/keybinds.h>
 #include "imgui.h"
+#include "trophy_overlay.h"
 
 extern void add_score_cheat(float amount);
 extern void reset_score_cheat();
@@ -16,6 +17,12 @@ bool get_wireframe();
 // unlocked (re-applied continuously). See maybe_unlock_all() in hooks.cpp.
 void set_unlock_all(bool val);
 bool get_unlock_all();
+
+// Texture dumping cvars
+bool get_tex_dump();
+void set_tex_dump(bool val);
+int  get_tex_dump_format_index();  // 0 = TGA, 1 = PNG
+void set_tex_dump_format_index(int idx);
 
 class CheatsDialog : public rex::ui::ImGuiDialog {
 public:
@@ -33,7 +40,7 @@ public:
     void OnDraw(ImGuiIO& /*io*/) override {
         if (!visible_) return;
 
-        ImGui::SetNextWindowSize(ImVec2(220.0f, 0.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(280.0f, 0.0f), ImGuiCond_FirstUseEver);
         if (ImGui::Begin("Cheats", &visible_)) {
             ImGui::Text("Score bonus: %.0f", get_score_bonus());
             ImGui::Separator();
@@ -52,6 +59,38 @@ public:
             bool ua = get_unlock_all();
             if (ImGui::Checkbox("Unlock all costumes/content", &ua))
                 set_unlock_all(ua);
+
+            ImGui::Separator();
+            ImGui::Text("Score Displays:");
+
+            bool trophy = get_trophy_overlay_visible();
+            if (ImGui::Checkbox("Score HUD Overlay (F10)", &trophy))
+                set_trophy_overlay_visible(trophy);
+
+            int mode = get_trophy_overlay_mode();
+            const char* modes[] = { "Countdown Remaining", "Absolute Targets" };
+            if (ImGui::Combo("Score HUD Mode (F9)", &mode, modes, 2))
+                set_trophy_overlay_mode(mode);
+
+            if (get_level_score() < 0) {
+                ImGui::TextDisabled("(HUD appears once in a level)");
+            }
+
+            bool obj_row = get_score_objective();
+            if (ImGui::Checkbox("Objective Menu Score Row", &obj_row))
+                set_score_objective(obj_row);
+
+            ImGui::Separator();
+            ImGui::Text("Texture Dumping:");
+
+            bool td = get_tex_dump();
+            if (ImGui::Checkbox("Dump Textures (tex_dump)", &td))
+                set_tex_dump(td);
+
+            int fmt = get_tex_dump_format_index();
+            const char* formats[] = { "TGA (.tga)", "PNG (.png)" };
+            if (ImGui::Combo("Dump Format", &fmt, formats, 2))
+                set_tex_dump_format_index(fmt);
         }
         ImGui::End();
     }
@@ -59,3 +98,4 @@ public:
 private:
     bool visible_ = false;
 };
+

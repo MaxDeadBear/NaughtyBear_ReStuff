@@ -46,7 +46,6 @@ static void restuff_cblip_beep() {}
 #include "renderer/guest_texture_decode.h"
 #include "renderer/native_backend_vk.h"
 #include "renderer/shader_pipeline.h"
-#include "renderer/scene_effect_boundary.h"
 #include "renderer/texture_mods.h"
 #include "renderer/up_draws.h"
 
@@ -55,9 +54,6 @@ static void restuff_cblip_beep() {}
 #include <draw2d.vert.spv.h>
 #include <draw2d_quad.frag.spv.h>
 #include <draw2d_text.frag.spv.h>
-#include <scene_cel.vert.spv.h>
-#include <scene_cel.frag.spv.h>
-#include <display_adjust.frag.spv.h>
 
 // hooks.cpp (M3.188): time-based late watchpoint arm, checked from our
 // per-frame loop below — the one site proven hot for the whole run (the
@@ -73,18 +69,6 @@ REXCVAR_DEFINE_BOOL(use_native_renderer, true, "Renderer",
                     "xenos GPU emulation plugin.");
 REXCVAR_DECLARE(bool, use_translated_shaders);  // defined in native_backend_vk.cpp
 REXCVAR_DECLARE(bool, tex_dump);                // defined in renderer/texture_mods.cpp
-REXCVAR_DEFINE_BOOL(cel_shading, false, "Modding",
-    "Experimental cel-style frame effect (includes HUD/menus). Toggle live.");
-REXCVAR_DEFINE_INT32(cel_bands, 5, "Modding",
-    "Brightness bands for the cel effect; fewer bands give a flatter look.").range(2, 12);
-REXCVAR_DEFINE_DOUBLE(cel_strength, 0.75, "Modding",
-    "Cel brightness band strength (0 = original, 1 = full bands).").range(0.0, 1.0);
-REXCVAR_DEFINE_DOUBLE(cel_edges, 0.35, "Modding",
-    "Dark image-edge strength for the cel effect (0 disables edges).").range(0.0, 1.0);
-REXCVAR_DEFINE_DOUBLE(display_brightness, 1.0, "Display",
-    "Native renderer brightness. 1 = original; higher is brighter. Changes live.").range(0.25, 2.0);
-REXCVAR_DEFINE_DOUBLE(display_gamma, 1.0, "Display",
-    "Native renderer gamma. 1 = original; higher lifts midtones. Changes live.").range(0.5, 3.0);
 
 namespace restuff::native { uint64_t CurrentPsHashForDebug(); }
 namespace restuff {
@@ -735,15 +719,13 @@ bool CreateDrawLayer(vk::VulkanProvider& provider) {
     if (df.vkCreateDescriptorSetLayout(device, &lci, nullptr, &dl.gamma_lut_layout) ==
         VK_SUCCESS) {
       const VkDescriptorSetLayout gsets[2] = {dl.ds_layout, dl.gamma_lut_layout};
-      const VkPushConstantRange gpc[] = {
-          {VK_SHADER_STAGE_VERTEX_BIT, 0, 16},
-          {VK_SHADER_STAGE_FRAGMENT_BIT, 16, 16}};
+      const VkPushConstantRange gpc = {VK_SHADER_STAGE_VERTEX_BIT, 0, 16};
       VkPipelineLayoutCreateInfo gpl = {};
       gpl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
       gpl.setLayoutCount = 2;
       gpl.pSetLayouts = gsets;
-      gpl.pushConstantRangeCount = 2;
-      gpl.pPushConstantRanges = gpc;
+      gpl.pushConstantRangeCount = 1;
+      gpl.pPushConstantRanges = &gpc;
       df.vkCreatePipelineLayout(device, &gpl, nullptr, &dl.gamma_pipeline_layout);
     }
     VkImageCreateInfo ici = {};
@@ -802,6 +784,17 @@ bool CreateDrawLayer(vk::VulkanProvider& provider) {
         "layout(location=3) in vec4 a_col2;\n"
         "layout(location=0) out vec2 v_uv;\n"
         "void main(){ v_uv = a_uv; gl_Position = vec4(a_pos * pc.so.xy + pc.so.zw, 0.0, 1.0); }\n";
+    static const char* kGammaFS =
+        "#version 450\n"
+        "layout(set=0, binding=0) uniform sampler2D srcTex;\n"
+        "layout(set=1, binding=0) uniform sampler2D lutTex;\n"
+        "layout(location=0) in vec2 v_uv;\n"
+        "layout(location=0) out vec4 o;\n"
+        "void main(){ vec4 c = texture(srcTex, v_uv);\n"
+        "  vec3 u = c.rgb * (255.0/256.0) + (0.5/256.0);\n"
+        "  o = vec4(texture(lutTex, vec2(u.r, 0.5)).r,\n"
+        "           texture(lutTex, vec2(u.g, 0.5)).g,\n"
+        "           texture(lutTex, vec2(u.b, 0.5)).b, 1.0); }\n";
     // M3.291/M3.292: tone-matched FS variant for 3D-scene frames only. The
     // user's matched-camera pair fits ours = 0.827 * reference^0.726 (shadow
     // SHAPES agree; the whole scene differs by one flatter display curve), so
@@ -830,9 +823,10 @@ bool CreateDrawLayer(vk::VulkanProvider& provider) {
         double(tg), double(tp));
     }
     auto gvs = renderer::spc::CompileGlsl(kGammaVS, /*is_vertex=*/true);
-    if (dl.gamma_set && !gvs.empty()) {
+    auto gfs = renderer::spc::CompileGlsl(kGammaFS, /*is_vertex=*/false);
+    if (dl.gamma_set && !gvs.empty() && !gfs.empty()) {
       VkShaderModule gvm = vk::util::CreateShaderModule(dev, gvs.data(), gvs.size() * 4);
-      VkShaderModule gfm = vk::util::CreateShaderModule(dev, kDisplayAdjustFS, sizeof(kDisplayAdjustFS));
+      VkShaderModule gfm = vk::util::CreateShaderModule(dev, gfs.data(), gfs.size() * 4);
       if (gvm && gfm) {
         VkPipelineShaderStageCreateInfo gst[2] = {};
         gst[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -1309,14 +1303,11 @@ const TexEntry* ResolveTextureEntry(vk::VulkanDevice* dev, const renderer::Guest
   uint32_t hash_gen = 0;
   const auto repl = renderer::texmod::FindReplacement(hash, &hash_gen);
   static const bool s_no_bc = getenv("RESTUFF_NO_BC") != nullptr;
-  // Latched, not live: it also gates the native-BC veto below, and flipping
-  // that mid-session would dump raw BC blocks as if they were RGBA. Set it in
-  // restuff.toml (read at the first texture upload, after config load).
-  static const bool s_tex_dump =
-      REXCVAR_GET(tex_dump) || getenv("RESTUFF_TEX_DUMP") != nullptr;
-  static const bool s_dump_tex_any =
-      getenv("RESTUFF_DUMP_TEX") != nullptr || getenv("RESTUFF_DUMP_TEX_RAW") != nullptr ||
-      s_tex_dump;
+  static const bool s_env_tex_dump = getenv("RESTUFF_TEX_DUMP") != nullptr;
+  static const bool s_env_dump_tex =
+      getenv("RESTUFF_DUMP_TEX") != nullptr || getenv("RESTUFF_DUMP_TEX_RAW") != nullptr;
+  const bool s_tex_dump = REXCVAR_GET(tex_dump) || s_env_tex_dump;
+  const bool s_dump_tex_any = s_env_dump_tex || s_tex_dump;
   static const bool s_no_srgb_fmt = getenv("RESTUFF_NO_SRGB") != nullptr;
   const bool is_dxt = tex.format == 18 || tex.format == 19 || tex.format == 20;
   // ... and a replacement forces the CPU/RGBA8 path for the same reason the
@@ -5169,10 +5160,13 @@ bool EnsureSceneTarget(vk::VulkanDevice* dev) {
     REXLOG_ERROR("[native_vk] M3.89 writeback buffer map failed (writeback disabled)");
   }
 
-  // Scene post-process resources are prepared once for live cel toggling.
-  // The pass is recorded only when cel shading or the opt-in tone is enabled.
-  // Cel uses the final front-buffer resolve; the legacy tone uses its UI boundary.
-  {
+  // M3.293: scene-tone pass objects. The tone is a scene property (fitted on
+  // gameplay content vs the user's endorsed reference), applied to the scene
+  // RT at the 3D->UI boundary inside the frame -- NEVER at present, and never
+  // by frame-level heuristics (a draw-count gate fried episode select; a
+  // global present curve fried the title). Skipped entirely under
+  // RESTUFF_NO_TONE=1.
+  if (getenv("RESTUFF_SCENE_TONE")) {  // M3.293 parked opt-in (see boundary note)
     VkImageCreateInfo tci = {};
     tci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     tci.imageType = VK_IMAGE_TYPE_2D;
@@ -5208,9 +5202,6 @@ bool EnsureSceneTarget(vk::VulkanDevice* dev) {
       tpl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
       tpl.setLayoutCount = 1;
       tpl.pSetLayouts = &tl.tone_set_layout;
-      VkPushConstantRange settings = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8 * sizeof(float)};
-      tpl.pushConstantRangeCount = 1;
-      tpl.pPushConstantRanges = &settings;
       df.vkCreatePipelineLayout(device, &tpl, nullptr, &tl.tone_pl_layout);
     }
     if (tl.tone_view && tl.tone_pl_layout) {
@@ -5241,9 +5232,28 @@ bool EnsureSceneTarget(vk::VulkanDevice* dev) {
       }
     }
     if (tl.tone_set) {
-      {
-        VkShaderModule vm = vk::util::CreateShaderModule(dev, kSceneCelVS, sizeof(kSceneCelVS));
-        VkShaderModule fm = vk::util::CreateShaderModule(dev, kSceneCelFS, sizeof(kSceneCelFS));
+      float tp = 1.377f, tg = 1.209f;
+      if (const char* e = getenv("RESTUFF_TONE_POWER")) tp = float(atof(e));
+      if (const char* e = getenv("RESTUFF_TONE_GAIN")) tg = float(atof(e));
+      static const char* kToneVS =
+          "#version 450\n"
+          "layout(location=0) out vec2 v_uv;\n"
+          "void main(){ vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+          "  v_uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+      char tfs[640];
+      std::snprintf(tfs, sizeof(tfs),
+          "#version 450\n"
+          "layout(set=0, binding=0) uniform sampler2D srcTex;\n"
+          "layout(location=0) in vec2 v_uv;\n"
+          "layout(location=0) out vec4 o;\n"
+          "void main(){ vec3 c = texture(srcTex, v_uv).rgb;\n"
+          "  o = vec4(pow(min(c * %f, vec3(1.0)), vec3(%f)), 1.0); }\n",
+          double(tg), double(tp));
+      auto tvs = renderer::spc::CompileGlsl(kToneVS, /*is_vertex=*/true);
+      auto tfsb = renderer::spc::CompileGlsl(tfs, /*is_vertex=*/false);
+      if (!tvs.empty() && !tfsb.empty()) {
+        VkShaderModule vm = vk::util::CreateShaderModule(dev, tvs.data(), tvs.size() * 4);
+        VkShaderModule fm = vk::util::CreateShaderModule(dev, tfsb.data(), tfsb.size() * 4);
         if (vm && fm) {
           VkPipelineShaderStageCreateInfo st[2] = {};
           st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -5300,7 +5310,7 @@ bool EnsureSceneTarget(vk::VulkanDevice* dev) {
         if (fm) df.vkDestroyShaderModule(device, fm, nullptr);
       }
     }
-    REXLOG_INFO("[native_vk] scene tone/cel pass {}",
+    REXLOG_INFO("[native_vk] M3.293 scene-tone pass {}",
                 tl.tone_pipeline ? "ready" : "UNAVAILABLE");
   }
 
@@ -5502,29 +5512,9 @@ PFN_vkCmdCopyImage CopyImageFn(vk::VulkanDevice* dev) {
 // Copies scene -> tone scratch, then draws tone(scratch) back over the scene
 // with a fullscreen pipeline (scene_rp_load: LOADs color+depth, writes color
 // only). Runs at the 3D->UI boundary so UI composites onto a toned scene.
-void RecordSceneTone(vk::VulkanDevice* dev, VkCommandBuffer cmd, bool cel_pass = false) {
+void RecordSceneTone(vk::VulkanDevice* dev, VkCommandBuffer cmd) {
   auto& tl = TL();
   if (!tl.tone_pipeline || !tl.tone_set || !tl.tone_img) return;
-  const auto copy_fn = CopyImageFn(dev);
-  if (!copy_fn) return;  // Never sample scratch data if the copy is unavailable.
-  const bool cel = cel_pass && REXCVAR_GET(cel_shading);
-  static const bool tone_requested = getenv("RESTUFF_SCENE_TONE") != nullptr;
-  const bool tone = !cel_pass && tone_requested;
-  if (!cel && !tone) return;
-  static const float tone_gain = [] {
-    const char* e = getenv("RESTUFF_TONE_GAIN");
-    return e ? float(atof(e)) : 1.209f;
-  }();
-  static const float tone_power = [] {
-    const char* e = getenv("RESTUFF_TONE_POWER");
-    return e ? float(atof(e)) : 1.377f;
-  }();
-  const float settings[8] = {
-      tone ? tone_gain : 1.f, tone ? tone_power : 1.f,
-      float(std::clamp(REXCVAR_GET(cel_bands), 2, 12)),
-      cel ? float(std::clamp(REXCVAR_GET(cel_strength), 0.0, 1.0)) : 0.f,
-      cel ? float(std::clamp(REXCVAR_GET(cel_edges), 0.0, 1.0)) : 0.f,
-      1.f / float(kGuestW), 1.f / float(kGuestH), 0.f};
   const auto& df = dev->functions();
   VkImageMemoryBarrier b[2] = {};
   b[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -5549,8 +5539,10 @@ void RecordSceneTone(vk::VulkanDevice* dev, VkCommandBuffer cmd, bool cel_pass =
   region.dstSubresource = region.srcSubresource;
   region.extent = {SceneW(), SceneH(), 1};
   // SDK function table lacks vkCmdCopyImage -- M3.129's lazy loader lookup.
-  copy_fn(cmd, tl.scene_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tl.tone_img,
-          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  if (auto copy_fn = CopyImageFn(dev)) {
+    copy_fn(cmd, tl.scene_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tl.tone_img,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  }
   b[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
   b[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
   b[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -5573,18 +5565,10 @@ void RecordSceneTone(vk::VulkanDevice* dev, VkCommandBuffer cmd, bool cel_pass =
   bi.pClearValues = clears;
   df.vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
   df.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tl.tone_pipeline);
-  df.vkCmdPushConstants(cmd, tl.tone_pl_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(settings), settings);
   df.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tl.tone_pl_layout, 0, 1,
                              &tl.tone_set, 0, nullptr);
   df.vkCmdDraw(cmd, 3, 1, 0, 0);
   df.vkCmdEndRenderPass(cmd);
-  if (cel) {
-    static std::atomic<uint32_t> s_cel_draws{0};
-    if (s_cel_draws.fetch_add(1, std::memory_order_relaxed) < 4)
-      REXLOG_INFO("[cel] pass recorded before front-buffer resolve: bands={} strength={} edges={}",
-                  settings[2], settings[3], settings[4]);
-  }
 }
 
 void RecordResolve(vk::VulkanDevice* dev, VkCommandBuffer cmd, const TransDrawRec& r,
@@ -9872,9 +9856,6 @@ void RecordSceneFrame(vk::VulkanDevice* dev, VkCommandBuffer cmd,
                   TranslatedLayer::kAuxSurfaces > 3 ? per_surf[4] : 0, res_n);
     }
   }
-  const size_t cel_resolve = REXCVAR_GET(cel_shading)
-      ? renderer::FindCelResolve(recs, tl.frame_fb ? tl.frame_fb : renderer::GetFrontBufferPhys())
-      : recs.size();
   size_t i = 0;
   while (i < recs.size()) {
     if (recs[i].is_resolve) {
@@ -9896,10 +9877,6 @@ void RecordSceneFrame(vk::VulkanDevice* dev, VkCommandBuffer cmd,
         df.vkCmdEndRenderPass(cmd);
         first = false;
         if (!a) scene_virgin = false;
-      }
-      if (i == cel_resolve) {
-        RecordSceneTone(dev, cmd, /*cel_pass=*/true);
-        GpMark(dev, cmd, kGpTone);
       }
       // M3.25: a DEPTH resolve ends the current depth pass (its result is saved
       // to a depth texture). The next main draw segment therefore begins a new
@@ -10568,9 +10545,7 @@ bool NativeVulkanGraphicsSystem::PresentClearFrame() {
         static const bool s_no_ramp = getenv("RESTUFF_NO_GAMMA_RAMP") != nullptr;
         {
           const uint32_t rv = restuff::native::GetGammaRampVersion();
-          // Keep the LUT image initialized even when its visual effect is
-          // disabled: brightness/gamma share this pipeline and descriptor set.
-          if (dl.gamma_pipeline && rv != 0 && rv != dl.gamma_uploaded_version) {
+          if (!s_no_ramp && dl.gamma_pipeline && rv != 0 && rv != dl.gamma_uploaded_version) {
             uint32_t packed[256];
             restuff::native::CopyGammaRamp(packed);
             PendingUpload up;
@@ -10728,30 +10703,23 @@ bool NativeVulkanGraphicsSystem::PresentClearFrame() {
               // has programmed one (identity before that -- skip the LUT).
               const bool use_ramp = !s_no_ramp && dl.gamma_pipeline &&
                                     dl.gamma_uploaded_version != 0;
-              const float display_pc[4] = {
-                  float(std::clamp(REXCVAR_GET(display_brightness), 0.25, 2.0)),
-                  float(std::clamp(REXCVAR_GET(display_gamma), 0.5, 3.0)),
-                  use_ramp ? 1.f : 0.f, 0.f};
-              const bool use_display = dl.gamma_pipeline && dl.gamma_uploaded_version != 0 &&
-                  (use_ramp || display_pc[0] != 1.f || display_pc[1] != 1.f);
               const VkPipelineLayout play =
-                  use_display ? dl.gamma_pipeline_layout : dl.pipeline_layout;
+                  use_ramp ? dl.gamma_pipeline_layout : dl.pipeline_layout;
               df.vkCmdPushConstants(cmd_buf_, play, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc),
                                     pc);
-              if (use_display)
-                df.vkCmdPushConstants(cmd_buf_, play, VK_SHADER_STAGE_FRAGMENT_BIT, 16,
-                                     sizeof(display_pc), display_pc);
               const VkDeviceSize vb_offset = 0;
               df.vkCmdBindVertexBuffers(cmd_buf_, 0, 1, &dl.vb, &vb_offset);
-              // Cel is already applied before the front-buffer resolve. This
-              // final draw applies the guest LUT and live display controls.
+              // M3.293: tone moved INTO the frame (scene-RT pass at the 3D->UI
+              // boundary; see RecordSceneTone). Present is plain LUT for every
+              // frame -- no frame-level tone selection ever again (a count gate
+              // fried episode select; a global curve fried the title).
               df.vkCmdBindPipeline(cmd_buf_, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                   use_display
+                                   use_ramp
                                        ? dl.gamma_pipeline
                                        : dl.pipelines[0][uint32_t(renderer::BlendMode::kPremul)]);
               df.vkCmdBindDescriptorSets(cmd_buf_, VK_PIPELINE_BIND_POINT_GRAPHICS, play, 0, 1,
                                          &it->second.set, 0, nullptr);
-              if (use_display)
+              if (use_ramp)
                 df.vkCmdBindDescriptorSets(cmd_buf_, VK_PIPELINE_BIND_POINT_GRAPHICS, play, 1, 1,
                                            &dl.gamma_set, 0, nullptr);
               df.vkCmdDraw(cmd_buf_, 6, 1, 0, 0);

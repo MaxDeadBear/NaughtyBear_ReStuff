@@ -135,33 +135,6 @@ REXCVAR_DEFINE_DOUBLE(freecam_speed, 8.0, "Gameplay",
 REXCVAR_DEFINE_DOUBLE(freecam_sensitivity, 0.0025, "Gameplay",
     "Free camera mouse-look sensitivity (radians/pixel).");
 
-// --- Local co-op recon (M1) --------------------------------------------------
-// READ-ONLY probe answering one question: can a campaign level host a second
-// player? HazingPlayerManager keeps players in a std::vector<Player*> at
-// mgr+48/+52 (same walk get_player_object uses), and the engine exposes
-// indexed/per-user-id accessors (GetPlayer, SetActivePlayerActorFromUserId,
-// GetSpawnerIds = sub_8281E310) because NETWORK multiplayer put real player
-// actors in levels. If campaign levels carry spawner/player capacity for more
-// than one, local co-op has somewhere to stand; if not, that reshapes the plan.
-// Dumps the vector, each player, and the manager's own fields (a user-id or
-// spawner list should be visible as structure). Nothing is written.
-REXCVAR_DEFINE_BOOL(coop_probe, false, "Modding",
-    "Log HazingPlayerManager player-vector + manager layout once in a level "
-    "(local co-op reconnaissance; read-only).");
-
-// M2 experiment: call the guest player-creation function ONCE and look at what
-// comes back. sub_8281C678(mgr, a2) allocates a HazingPlayerActor (5392 bytes)
-// and constructs it with spawnerId = the CURRENT player count -- so with one
-// player live it must return an actor tagged 1. a2 is a polymorphic pointer the
-// constructor queries virtually, but sub_82833BB8 explicitly handles a2 == 0
-// (substituting -1), so NULL is a legal argument and nothing has to be guessed.
-// The result is an ORPHAN: create never touches the roster vector (its caller
-// does the push_back), so this cannot disturb the live player list -- the
-// vector is logged before and after to prove exactly that.
-REXCVAR_DEFINE_BOOL(coop_spawn_test, false, "Modding",
-    "ONE-SHOT: call the guest player-creation function in a level and log the "
-    "result WITHOUT adding it to the roster (local co-op M2 probe).");
-
 // Dump every loaded Lua chunk's bytecode to lua_dump/<path> (basis: lua_mods
 // branch). Use to extract the per-level medal score targets.
 REXCVAR_DEFINE_BOOL(lua_dump_originals, false, "Modding",
@@ -176,8 +149,6 @@ static void update_score_objective();
 static void update_attract(double dt);
 static void update_bearcam();
 static void update_freecam();
-static void update_coop_probe();
-static void update_coop_spawn_test();
 static void maybe_unlock_all();
 // Set Windows timer resolution to 1ms for the lifetime of the process.
 // Default is 15.6ms which causes sleep_until to overshoot badly. On Linux the
@@ -362,10 +333,6 @@ void on_swap() {
 
     // Free camera: fly the render camera with WASD + mouse when active.
     update_freecam();
-
-    // M1 local co-op reconnaissance (read-only, coop_probe cvar).
-    update_coop_probe();
-    update_coop_spawn_test();
 
     // One-shot "unlock everything" when requested via the unlock_all cvar.
     maybe_unlock_all();
@@ -856,22 +823,17 @@ static void maybe_unlock_all() {
 }
 
 // --- Guest input suppression ------------------------------------------------
-// While the difficulty panel is open it reads the pad host-side (InputSystem),
-// so the guest must not see the same presses or the game menu underneath would
-// navigate too. The title funnels ALL pad reads through two XamInput wrappers;
-// overriding them (strong symbol over the codegen'd weak alias) blanks what
-// the game sees while suppression is on:
+// Overrides XamInput wrappers to blank what the game sees while host-side
+// suppression is active (e.g. during free camera navigation or attract-mode video):
 //   sub_830B3EF0: r3=user, r4=X_INPUT_STATE* -> XamInputGetState. Run the
 //     original, then zero the 12-byte X_INPUT_GAMEPAD at state+4 (packet
 //     number stays, so the game just sees "connected, nothing pressed").
 //   sub_830B3FC8: keystroke wrapper -> XamInputGetKeystrokeEx. Return
 //     X_ERROR_EMPTY (0x10D2, "no keystrokes queued") without calling it.
 //
-// Suppression does NOT lift the instant the panel closes: the A press that
-// picked a difficulty is usually still held, and the game's edge detector
-// would see it as a brand-new press and activate the menu item behind the
-// panel. So closing enters a "held until release" state that keeps blanking
-// until the pad reads fully idle, then clears itself.
+// Suppression closing enters a "held until release" state that keeps blanking
+// until the pad reads fully idle, then clears itself so button releases don't
+// trigger unintended in-game inputs.
 
 enum : int { kInputPass = 0, kInputBlank = 1, kInputUntilRelease = 2 };
 static std::atomic<int> g_input_suppress{kInputPass};
@@ -2025,10 +1987,43 @@ void objbox_push_score(bool append) {
 
 }  // namespace
 
-// Runtime toggle for the native row (F10 double-tap in trophy_overlay.h; also
-// editable in the F4 settings menu since it's a plain cvar).
+// Runtime toggle for the native row (in cheats overlay F11, or F10 double-tap;
+// also editable in the F4 settings menu since it's a plain cvar).
 bool get_score_objective()       { return REXCVAR_GET(score_objective); }
-void set_score_objective(bool v) { REXCVAR_SET(score_objective, v); }
+void set_score_objective(bool v) {
+    REXCVAR_SET(score_objective, v);
+    auto* mem = rex::system::kernel_memory();
+    if (!mem) return;
+    uint8_t* base = mem->virtual_membase();
+    if (!base) return;
+
+    if (!v) {
+        // Toggled OFF: immediately blank the text in Flash if row is currently on screen
+        const int idx = g_score_row.load(std::memory_order_relaxed);
+        auto* fd = rex::Runtime::instance()->function_dispatcher();
+        if (idx >= 0 && fd && g_score_text_guest) {
+            const uint32_t hud = objbox_hud(base);
+            auto* fn = fd->GetFunction(kFnSetObjText);
+            if (hud && fn) {
+                char* gstr = mem->TranslateVirtual<char*>(g_score_text_guest);
+                if (gstr) {
+                    gstr[0] = '\0';
+                    g_objbox_self.store(true, std::memory_order_relaxed);
+                    rex::ppc::GuestToHostFunction<void>(*fn, hud,
+                                                        static_cast<uint32_t>(idx),
+                                                        g_score_text_guest);
+                    g_objbox_self.store(false, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
+    // Force manager to rebuild the box (with or without our row)
+    const uint32_t mgr = g_obj_mgr.load(std::memory_order_relaxed);
+    if (ptr_ok(mgr) && host_readable(base, mgr + 28)) {
+        base[mgr + 28] = 1;
+    }
+}
 
 // Per-frame (on_swap): live-update our row's text. Appends happen exclusively
 // in on_obj_refresh_end (game thread, right after the rebuild), so this only
@@ -2036,26 +2031,37 @@ void set_score_objective(bool v) { REXCVAR_SET(score_objective, v); }
 static void update_score_objective() {
     static int tick = 0;
     if (tick++ % 15 != 0) return;  // ~4 Hz; the row is a readout, not a counter
-    if (g_score_row.load(std::memory_order_relaxed) < 0) return;
     if (g_obj_in_refresh.load(std::memory_order_relaxed)) return;
 
-    if (!REXCVAR_GET(score_objective)) {
-        // Toggled off with a live row. The box has no per-row remove (blanking
-        // the text leaves the row's icon behind), so set the manager's
-        // rows-dirty byte (mgr+28) -- the same flag its own objective changes
-        // set -- and the next refresh does Clear + re-add of just the game's
-        // rows. Our clear hook then resets the bookkeeping, and with the cvar
-        // off the refresh tail won't re-append.
+    const bool wanted = REXCVAR_GET(score_objective);
+    const int  cur_row = g_score_row.load(std::memory_order_relaxed);
+
+    if (!wanted) {
+        if (cur_row >= 0) {
+            // Still has a live row on screen: force panel rebuild to clear it
+            auto* mem = rex::system::kernel_memory();
+            if (!mem) return;
+            uint8_t* base = mem->virtual_membase();
+            const uint32_t mgr = g_obj_mgr.load(std::memory_order_relaxed);
+            if (base && ptr_ok(mgr) && host_readable(base, mgr + 28)) {
+                base[mgr + 28] = 1;
+            }
+        }
+        return;
+    }
+
+    if (cur_row < 0) {
+        // Toggled on but no row yet: force panel rebuild so on_obj_refresh_end appends it
         auto* mem = rex::system::kernel_memory();
         if (!mem) return;
         uint8_t* base = mem->virtual_membase();
         const uint32_t mgr = g_obj_mgr.load(std::memory_order_relaxed);
-        if (!base || !ptr_ok(mgr) || !host_readable(base, mgr + 28)) return;
-        base[mgr + 28] = 1;
-        if (REXCVAR_GET(score_objective_debug))
-            REXLOG_INFO("[objbox] toggle off -> forcing panel rebuild");
+        if (base && ptr_ok(mgr) && host_readable(base, mgr + 28)) {
+            base[mgr + 28] = 1;
+        }
         return;
     }
+
     objbox_push_score(/*append=*/false);
 }
 
@@ -2111,6 +2117,7 @@ void on_obj_refresh_begin(PPCRegister& r3) {
 
 void on_obj_refresh_end() {
     g_obj_in_refresh.store(false, std::memory_order_relaxed);
+    if (!REXCVAR_GET(score_objective)) return;
     if (g_score_row.load(std::memory_order_relaxed) >= 0) return;  // still there
     auto* mem = rex::system::kernel_memory();
     if (!mem) return;
@@ -2692,188 +2699,6 @@ static void update_freecam() {
                     g_freecam.x, g_freecam.y, g_freecam.z, g_freecam.yaw, g_freecam.pitch);
     }
 #endif  // _WIN32
-}
-
-// ---------------------------------------------------------------------------
-// Local co-op recon (M1) -- read-only
-// ---------------------------------------------------------------------------
-static void update_coop_probe() {
-    if (!REXCVAR_GET(coop_probe)) return;
-    static int tick = 0;
-    if (tick++ % 120 != 0) return;  // ~2s at 60fps; this is a dump, not a poll
-
-    auto* mem = rex::system::kernel_memory();
-    if (!mem) return;
-    uint8_t* base = mem->virtual_membase();
-    if (!base) return;
-
-    bool ok = false;
-    const uint32_t mgr = rd32_safe(base, 0x83326814, ok);
-    if (!ok || !ptr_ok(mgr)) return;                 // no manager yet (frontend)
-    const uint32_t begin = rd32_safe(base, mgr + 48, ok);
-    if (!ok || !ptr_ok(begin)) return;
-    const uint32_t end = rd32_safe(base, mgr + 52, ok);
-    if (!ok || end < begin) return;
-
-    const uint32_t count = (end - begin) / 4u;
-    const uint32_t cap_end = rd32_safe(base, mgr + 56, ok);   // vector capacity end
-    const uint32_t capacity = (ok && cap_end >= begin) ? (cap_end - begin) / 4u : 0u;
-
-    // Is a player actually IN the world yet? player[0]+36 is the game object;
-    // it stays NULL in the frontend. This has to be part of the change
-    // signature: entering a level changes neither mgr nor count (the manager
-    // persists and the count stays 1), so keying on those alone went quiet
-    // exactly when the level -- the interesting state -- finally loaded.
-    uint32_t p0 = 0, obj0 = 0;
-    if (count) {
-        p0 = rd32_safe(base, begin, ok);
-        if (ok && ptr_ok(p0)) obj0 = rd32_safe(base, p0 + 36, ok);
-    }
-
-    static uint32_t last_sig = 0;
-    const uint32_t sig = mgr ^ (count * 2654435761u) ^ (capacity * 40503u) ^
-                         (obj0 ? 0x5BD1E995u : 0u);
-    if (sig == last_sig) return;
-    last_sig = sig;
-
-    REXLOG_INFO("[coop] mgr={:08X} vec begin={:08X} end={:08X} players={} capacity={} in_level={}",
-                mgr, begin, end, count, capacity, obj0 ? "YES" : "no");
-
-    for (uint32_t i = 0; i < count && i < 8; ++i) {
-        const uint32_t p = rd32_safe(base, begin + i * 4u, ok);
-        if (!ok || !ptr_ok(p)) { REXLOG_INFO("[coop]   player[{}] = <bad>", i); continue; }
-        const uint32_t obj = rd32_safe(base, p + 36, ok);
-        // GetSpawnerIds (sub_8281E310) is just a loop over the player vector
-        // reading player+0x14C0 -- so the spawner id is a plain read, and
-        // calling the guest function would add allocation + a destructor for
-        // nothing. FindPlayerForSpawnerId takes a hazingPlayer::ActorSpawnerID,
-        // so this value identifies WHICH player slot the actor occupies.
-        bool sok = false;
-        const uint32_t spawner_id = rd32_safe(base, p + 0x14C0, sok);
-        REXLOG_INFO("[coop]   player[{}] = {:08X}  obj(+36)={:08X}  spawner_id(+14C0)={:08X}",
-                    i, p, ok ? obj : 0, sok ? spawner_id : 0xFFFFFFFFu);
-        // Small field dump: a user id / pad index / spawner id should stand out
-        // as a small integer among pointers.
-        for (uint32_t row = 0; row < 0x60; row += 16) {
-            char line[160];
-            int o = std::snprintf(line, sizeof(line), "[coop]     p+%02X:", row);
-            for (uint32_t off = row; off < row + 16; off += 4) {
-                const uint32_t w = rd32_safe(base, p + off, ok);
-                o += std::snprintf(line + o, sizeof(line) - (size_t)o, " %08X", ok ? w : 0);
-            }
-            REXLOG_INFO("{}", line);
-        }
-    }
-
-    // Manager fields: the spawner list (GetSpawnerIds = sub_8281E310 reads it)
-    // and any active-actor/user-id bookkeeping live in here. 'V' marks a word
-    // that looks like a live guest pointer, which is how the vectors show up.
-    for (uint32_t row = 0; row < 0x100; row += 16) {
-        char line[160];
-        int o = std::snprintf(line, sizeof(line), "[coop]   mgr+%02X:", row);
-        for (uint32_t off = row; off < row + 16; off += 4) {
-            const uint32_t w = rd32_safe(base, mgr + off, ok);
-            const char tag = (ok && ptr_ok(w) && host_readable(base, w)) ? 'V' : ' ';
-            o += std::snprintf(line + o, sizeof(line) - (size_t)o, " %08X%c", ok ? w : 0, tag);
-        }
-        REXLOG_INFO("{}", line);
-    }
-
-    // gameSpawner::SpawnerManager -- the LEVEL's spawn-point registry, and the
-    // thing that actually decides whether a second player has anywhere to go.
-    // Its SWIG GetInstance (sub_82649260) just returns this global, so no call
-    // is needed. Vectors show up here as begin/end/capacity pointer triples the
-    // same way the player vector does at mgr+0x30.
-    const uint32_t smgr = rd32_safe(base, 0x83326770, ok);
-    if (!ok || !ptr_ok(smgr)) {
-        REXLOG_INFO("[coop] SpawnerManager: <null>");
-        return;
-    }
-    REXLOG_INFO("[coop] SpawnerManager = {:08X}", smgr);
-    for (uint32_t row = 0; row < 0x100; row += 16) {
-        char line[160];
-        int o = std::snprintf(line, sizeof(line), "[coop]   smgr+%02X:", row);
-        for (uint32_t off = row; off < row + 16; off += 4) {
-            const uint32_t w = rd32_safe(base, smgr + off, ok);
-            const char tag = (ok && ptr_ok(w) && host_readable(base, w)) ? 'V' : ' ';
-            o += std::snprintf(line + o, sizeof(line) - (size_t)o, " %08X%c", ok ? w : 0, tag);
-        }
-        REXLOG_INFO("{}", line);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Local co-op M2 experiment -- one-shot, orphan create
-// ---------------------------------------------------------------------------
-static void update_coop_spawn_test() {
-    if (!REXCVAR_GET(coop_spawn_test)) return;
-    static bool fired = false;
-    if (fired) return;
-
-    auto* mem = rex::system::kernel_memory();
-    auto* rt  = rex::Runtime::instance();
-    if (!mem || !rt) return;
-    auto* fd = rt->function_dispatcher();
-    if (!fd) return;
-    uint8_t* base = mem->virtual_membase();
-    if (!base) return;
-
-    bool ok = false;
-    const uint32_t mgr = rd32_safe(base, 0x83326814, ok);
-    if (!ok || !ptr_ok(mgr)) return;
-    const uint32_t begin = rd32_safe(base, mgr + 48, ok);
-    if (!ok || !ptr_ok(begin)) return;
-    const uint32_t end = rd32_safe(base, mgr + 52, ok);
-    if (!ok || end <= begin) return;
-
-    // Only fire in a LIVE level: player[0] must have its game object wired,
-    // otherwise the engine state the constructor touches may not be up yet.
-    const uint32_t p0 = rd32_safe(base, begin, ok);
-    if (!ok || !ptr_ok(p0)) return;
-    const uint32_t obj0 = rd32_safe(base, p0 + 36, ok);
-    if (!ok || !ptr_ok(obj0)) return;
-
-    auto* fn = fd->GetFunction(0x8281C678u);
-    if (!fn) {
-        fired = true;
-        REXLOG_WARN("[coop] SPAWN TEST: 0x8281C678 not registered with the dispatcher "
-                    "-- add it to [entrypoint.functions] in restuff_manifest.toml");
-        return;
-    }
-
-    fired = true;
-    const uint32_t before = (end - begin) / 4u;
-    REXLOG_INFO("[coop] SPAWN TEST: calling sub_8281C678(mgr={:08X}, a2=0); players before={}",
-                mgr, before);
-
-    const uint32_t np = rex::ppc::GuestToHostFunction<uint32_t>(*fn, mgr, 0u);
-
-    // The roster must be byte-identical: create only allocates + constructs.
-    const uint32_t begin2 = rd32_safe(base, mgr + 48, ok);
-    const uint32_t end2   = rd32_safe(base, mgr + 52, ok);
-    const uint32_t after  = (ok && end2 > begin2) ? (end2 - begin2) / 4u : 0u;
-    REXLOG_INFO("[coop] SPAWN TEST: returned {:08X}; roster begin={:08X} end={:08X} players={} ({})",
-                np, begin2, end2, after,
-                (begin2 == begin && end2 == end) ? "roster UNCHANGED, as expected"
-                                                 : "ROSTER MOVED -- unexpected");
-
-    if (!ptr_ok(np) || !host_readable(base, np)) {
-        REXLOG_WARN("[coop] SPAWN TEST: returned pointer is not readable -- create failed");
-        return;
-    }
-    const uint32_t vt  = rd32_safe(base, np, ok);
-    const uint32_t sid = rd32_safe(base, np + 0x14C0, ok);
-    REXLOG_INFO("[coop] SPAWN TEST: new actor vtable={:08X} (expect 82228D98), "
-                "spawner_id={:08X} (expect 00000001)", vt, sid);
-    for (uint32_t row = 0; row < 0x60; row += 16) {
-        char line[160];
-        int o = std::snprintf(line, sizeof(line), "[coop]   new+%02X:", row);
-        for (uint32_t off = row; off < row + 16; off += 4) {
-            const uint32_t w = rd32_safe(base, np + off, ok);
-            o += std::snprintf(line + o, sizeof(line) - (size_t)o, " %08X", ok ? w : 0);
-        }
-        REXLOG_INFO("{}", line);
-    }
 }
 
 // --- Attract-mode video ------------------------------------------------------

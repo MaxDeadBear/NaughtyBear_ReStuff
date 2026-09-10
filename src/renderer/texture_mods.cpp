@@ -526,3 +526,22 @@ std::shared_ptr<const Replacement> FindReplacement(uint64_t hash, uint32_t* gene
 }
 
 }  // namespace restuff::renderer::texmod
+
+bool get_tex_dump() {
+  return REXCVAR_GET(tex_dump);
+}
+
+void set_tex_dump(bool val) {
+  REXCVAR_SET(tex_dump, val);
+}
+
+int get_tex_dump_format_index() {
+  std::string fmt = REXCVAR_GET(tex_dump_format);
+  for (char& c : fmt) c = char(::tolower(static_cast<unsigned char>(c)));
+  return (fmt == "png") ? 1 : 0;
+}
+
+void set_tex_dump_format_index(int idx) {
+  REXCVAR_SET(tex_dump_format, idx == 1 ? "png" : "tga");
+}
+
