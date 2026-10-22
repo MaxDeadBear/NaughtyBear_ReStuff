@@ -1,6 +1,6 @@
 <img width="1024" height="512" alt="logo" src="https://github.com/user-attachments/assets/2bf3f451-05f7-40a8-80ce-93ad4740b90a" />
 
-
+discord found here https://discord.gg/Vqt5AvFYqb
 
 What is ReStuff?
 ---------------------------------------------
